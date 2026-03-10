@@ -1,0 +1,30 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # postgres:
+  #   image: postgres:16-alpine
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     POSTGRES_USER: agent_user
+  #     POSTGRES_PASSWORD: agent_pass
+  #     POSTGRES_DB: agent_memory
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  postgres_data:
