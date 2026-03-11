@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # --- Infrastructure URLs ---
     redis_url: str = "redis://localhost:6379"
     qdrant_url: str = "http://localhost:6333"
+    postgres_url: str = "postgresql://agent_user:agent_pass@localhost:5432/agent_memory"
 
     # --- Model Settings ---
     default_model: str = "claude-sonnet-4-20250514"

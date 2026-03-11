@@ -90,18 +90,40 @@ def create_orchestrator():
             temperature=0.7,
         )
 
-        # Use mock memory for now — swap to real MemoryManager when infra is ready
-        from unittest.mock import AsyncMock, MagicMock
+        # Real MemoryManager — connects to Redis, Qdrant, Mem0, and optionally Postgres
+        from investment_research_system.memory.manager import MemoryManager
+        from investment_research_system.memory.short_term import ShortTermMemory
+        from investment_research_system.memory.long_term import LongTermMemory
+        from investment_research_system.memory.semantic import SemanticMemory
 
-        memory = MagicMock()
-        memory.parallel_search = AsyncMock(return_value={
-            "long_term": [],
-            "semantic": [],
-        })
-        memory.update_agent_status = AsyncMock()
-        memory.store_research = AsyncMock()
-        memory.create_session = AsyncMock()
-        memory.end_session = AsyncMock()
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+
+        short_term = ShortTermMemory(redis_url=redis_url)
+        long_term = LongTermMemory(qdrant_url=qdrant_url)
+        semantic = SemanticMemory()
+
+        # Postgres is optional — if it's not running, memory still works without it
+        episodic = None
+        postgres_url = os.getenv("POSTGRES_URL", "postgresql://agent_user:agent_pass@localhost:5432/agent_memory")
+        try:
+            from investment_research_system.memory.database import create_tables, get_engine, get_session_factory
+            from investment_research_system.memory.episodic import EpisodicMemory
+
+            engine = get_engine(postgres_url)
+            create_tables(engine)
+            session_factory = get_session_factory(engine)
+            episodic = EpisodicMemory(session_factory=session_factory)
+            logger.info("[dependencies] Postgres episodic memory connected")
+        except Exception as e:
+            logger.warning("[dependencies] Postgres unavailable, episodic memory disabled: %s", e)
+
+        memory = MemoryManager(
+            short_term=short_term,
+            long_term=long_term,
+            semantic=semantic,
+            episodic=episodic,
+        )
 
         tavily = TavilySearch(api_key=tavily_key)
 

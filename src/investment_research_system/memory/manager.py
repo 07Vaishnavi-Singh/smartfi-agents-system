@@ -18,6 +18,7 @@ WHY: If you swap Qdrant for Pinecone tomorrow, you change THIS file only.
 import asyncio
 import logging
 
+from investment_research_system.memory.episodic import EpisodicMemory
 from investment_research_system.memory.long_term import LongTermMemory
 from investment_research_system.memory.semantic import SemanticMemory
 from investment_research_system.memory.short_term import ShortTermMemory
@@ -43,22 +44,26 @@ class MemoryManager:
         short_term: ShortTermMemory,
         long_term: LongTermMemory,
         semantic: SemanticMemory,
+        episodic: EpisodicMemory | None = None,
     ):
         self.short_term = short_term
         self.long_term = long_term
         self.semantic = semantic
+        self.episodic = episodic
 
     # =========================================================================
     # SESSION MANAGEMENT (Redis)
     # =========================================================================
 
     async def create_session(self, session_id: str, query: str) -> None:
-        """Start a new research session."""
+        """Start a new research session in Redis + Postgres."""
         await self.short_term.store(
             session_id,
             "metadata",
             {"query": query, "status": "started"},
         )
+        if self.episodic:
+            await asyncio.to_thread(self.episodic.create_episode, session_id, query)
         logger.info("Session created: %s", session_id)
 
     async def update_session_status(self, session_id: str, status: str) -> None:
@@ -164,15 +169,31 @@ class MemoryManager:
             {"content": content[:500], "agent_name": agent_name},
         )
 
+        # Store in Postgres (episodic — decision audit trail)
+        if self.episodic:
+            await asyncio.to_thread(
+                self.episodic.log_decision,
+                session_id,
+                agent_name,
+                "research",
+                content[:500],
+            )
+
         logger.info("Research stored for agent %s in session %s", agent_name, session_id)
 
     # =========================================================================
     # CLEANUP
     # =========================================================================
 
-    async def end_session(self, session_id: str) -> None:
-        """Clean up session data from Redis."""
+    async def end_session(
+        self, session_id: str, total_tokens: int = 0, total_cost_usd: float = 0.0
+    ) -> None:
+        """Clean up Redis session and mark Postgres episode as completed."""
         await self.short_term.delete_session(session_id)
+        if self.episodic:
+            await asyncio.to_thread(
+                self.episodic.complete_episode, session_id, total_tokens, total_cost_usd
+            )
         logger.info("Session ended: %s", session_id)
 
     # =========================================================================
@@ -188,8 +209,12 @@ class MemoryManager:
         """
         redis_ok = await self.short_term.ping()
         qdrant_ok = await asyncio.to_thread(self.long_term.ping)
+        postgres_ok = False
+        if self.episodic:
+            postgres_ok = await asyncio.to_thread(self.episodic.ping)
 
         return {
             "redis": redis_ok,
             "qdrant": qdrant_ok,
+            "postgres": postgres_ok,
         }
