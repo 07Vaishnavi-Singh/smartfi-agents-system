@@ -72,6 +72,7 @@ class HealthResponse(BaseModel):
 
     status: str
     version: str
+    tracing_enabled: bool
     timestamp: str
 
 
@@ -201,8 +202,11 @@ async def get_research_status(
 )
 async def health_check() -> HealthResponse:
     """Service health check. Always returns 200 if the server is running."""
+    from investment_research_system.observability.tracing import is_tracing_enabled
+
     return HealthResponse(
         status="ok",
         version="0.1.0",
+        tracing_enabled=is_tracing_enabled(),
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
