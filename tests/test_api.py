@@ -103,6 +103,7 @@ def test_health_endpoint(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
+    assert "tracing_enabled" in data
 
 
 def test_create_research_job(client):
@@ -166,3 +167,63 @@ def test_create_research_invalid_body(client):
     """POST /research with missing query returns 422."""
     response = client.post("/research", json={})
     assert response.status_code == 422
+
+
+# --- Tracing Tests ---
+
+def test_tracing_init_without_key():
+    """Tracing should be disabled when no API key is set."""
+    import os
+    from investment_research_system.observability.tracing import init_tracing, is_tracing_enabled
+
+    # Remove key if present
+    old_key = os.environ.pop("LANGSMITH_API_KEY", None)
+    os.environ.pop("LANGCHAIN_TRACING_V2", None)
+
+    result = init_tracing()
+    assert result is False
+    assert is_tracing_enabled() is False
+
+    # Restore if was set
+    if old_key:
+        os.environ["LANGSMITH_API_KEY"] = old_key
+
+
+def test_tracing_init_with_key():
+    """Tracing should be enabled when API key is set."""
+    import os
+    from investment_research_system.observability.tracing import init_tracing, is_tracing_enabled
+
+    # Set a fake key
+    old_key = os.environ.get("LANGSMITH_API_KEY")
+    os.environ["LANGSMITH_API_KEY"] = "fake-key-for-testing"
+
+    result = init_tracing(project_name="test-project")
+    assert result is True
+    assert is_tracing_enabled() is True
+    assert os.environ["LANGCHAIN_PROJECT"] == "test-project"
+
+    # Cleanup
+    os.environ.pop("LANGCHAIN_TRACING_V2", None)
+    if old_key:
+        os.environ["LANGSMITH_API_KEY"] = old_key
+    else:
+        os.environ.pop("LANGSMITH_API_KEY", None)
+
+
+def test_run_config_structure():
+    """get_run_config returns correct structure for LangGraph."""
+    from investment_research_system.observability.tracing import get_run_config
+
+    config = get_run_config(
+        query="Should I invest in NVIDIA?",
+        session_id="test-session-123",
+        run_name="test run",
+    )
+
+    assert "metadata" in config
+    assert config["metadata"]["session_id"] == "test-session-123"
+    assert "NVIDIA" in config["metadata"]["query_preview"]
+    assert "tags" in config
+    assert "investment-research" in config["tags"]
+    assert config["run_name"] == "test run"

@@ -15,10 +15,12 @@ headers to every response.
 
 import logging
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from investment_research_system.api.routes import router
+from investment_research_system.observability.tracing import init_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +29,19 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application.
 
     Returns a fully configured app with:
+    - LangSmith tracing (if API key is set)
     - CORS middleware (allows Streamlit UI to call the API)
     - Research routes mounted
     - Health check endpoint
     """
+    # Load .env before anything else
+    load_dotenv()
+
+    # Initialize LangSmith tracing — must happen before any LLM calls.
+    # If LANGSMITH_API_KEY is missing, tracing is silently disabled.
+    tracing_enabled = init_tracing()
+    logger.info("[app] LangSmith tracing: %s", "enabled" if tracing_enabled else "disabled")
+
     app = FastAPI(
         title="Investment Research API",
         description="Multi-agent investment research system with async job processing",

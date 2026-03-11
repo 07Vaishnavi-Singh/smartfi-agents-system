@@ -55,6 +55,7 @@ from typing_extensions import TypedDict
 
 from investment_research_system.agents.base import BaseAgent
 from investment_research_system.models.schemas import AgentResponse, ResearchQuery, ResearchReport
+from investment_research_system.observability.tracing import get_run_config
 from investment_research_system.orchestrator.conflict import detect_conflicts, format_conflicts_summary
 from investment_research_system.orchestrator.quality import QualityAssessment, assess_quality, format_quality_summary
 
@@ -476,8 +477,17 @@ class ResearchOrchestrator:
 
         logger.info("[orchestrator] Starting research: %s", query.query[:80])
 
+        # Build LangSmith config — attaches metadata to the trace
+        # so you can search/filter traces in the dashboard.
+        # If LangSmith is not enabled, this is just an inert dict.
+        config = get_run_config(
+            query=query.query,
+            session_id=session_id,
+            run_name=f"research: {query.query[:50]}",
+        )
+
         # Run the graph
-        final_state = await self.graph.ainvoke(initial_state)
+        final_state = await self.graph.ainvoke(initial_state, config=config)
 
         report = final_state["report"]
         if report is None:
