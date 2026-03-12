@@ -18,6 +18,28 @@ class SourceType(str, Enum):
 
 
 # --- Core Schemas ---
+class LLMResponseStatus(str, Enum):
+    """Whether the LLM completed the analysis or refused."""
+    completed = "completed"
+    refused = "refused"
+
+
+class LLMStructuredResponse(BaseModel):
+    """Structured output schema for LLM responses.
+
+    Instead of parsing free text for refusal patterns ("I cannot..."),
+    the LLM explicitly declares its status. This eliminates false positives
+    where Claude legitimately says "I cannot confirm this data" as part
+    of a completed analysis.
+
+    TS equivalent: interface LLMResponse { status: "completed" | "refused"; ... }
+    Rust equivalent: enum ResponseStatus { Completed(String), Refused(String) }
+    """
+    status: LLMResponseStatus
+    analysis: str = ""
+    refusal_reason: str = ""
+
+
 class Source(BaseModel):
     """Where a piece of information came from."""
     title: str
