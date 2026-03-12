@@ -54,6 +54,14 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from investment_research_system.agents.base import BaseAgent
+from investment_research_system.errors import (
+    AgentError,
+    BudgetExceededError,
+    LLMRateLimitError,
+    LLMRefusalError,
+    LLMTimeoutError,
+    MemoryUnavailableError,
+)
 from investment_research_system.models.schemas import AgentResponse, ResearchQuery, ResearchReport
 from investment_research_system.observability.tracing import get_run_config
 from investment_research_system.orchestrator.conflict import detect_conflicts, format_conflicts_summary
@@ -257,15 +265,15 @@ class ResearchOrchestrator:
     # =========================================================================
 
     async def _run_agent_with_retry(self, agent: BaseAgent, query: str, session_id: str) -> AgentResponse | None:
-        """Run a single agent with retry + circuit breaker.
+        """Run a single agent with retry + circuit breaker + typed error handling.
 
-        Used by both gatherer and analyzer nodes.
+        Uses the error hierarchy to make intelligent recovery decisions:
+        - Timeout/rate limit → retry with backoff
+        - Refusal/budget exceeded → don't retry (won't help)
+        - Memory unavailable → retry (transient infra issue)
+        - Unknown error → retry (might be transient)
+
         Returns None if the agent fails after all retries.
-
-        PYTHON CONCEPT — extracted helper method:
-        Both _node_run_gatherers and _node_run_analyzers need the same
-        retry logic. Instead of duplicating it, we extract it here.
-        Same as extracting a private function in TS/Rust.
         """
         if not self.circuit_breaker.can_call(agent.name):
             logger.warning("[orchestrator] Skipping %s — circuit breaker OPEN", agent.name)
@@ -276,10 +284,60 @@ class ResearchOrchestrator:
                 response = await agent.run(query, session_id)
                 self.circuit_breaker.record_success(agent.name)
                 return response
-            except Exception as e:
+
+            except BudgetExceededError:
+                # Hard stop — retrying or switching providers won't help
+                logger.info("[orchestrator] %s hit budget limit, stopping", agent.name)
+                return None
+
+            except LLMRefusalError as e:
+                # Model won't answer this — retrying is pointless
+                logger.warning("[orchestrator] %s refused query: %s", agent.name, e)
+                return None
+
+            except LLMRateLimitError as e:
+                # Backoff harder on rate limits (exponential)
+                logger.warning(
+                    "[orchestrator] %s rate limited (attempt %d/%d): %s",
+                    agent.name, attempt + 1, self.max_retries + 1, e,
+                )
+                if attempt < self.max_retries:
+                    backoff = self.retry_delay * (2 ** attempt)
+                    await asyncio.sleep(backoff)
+
+            except LLMTimeoutError as e:
+                # Transient — retry with linear backoff
+                logger.warning(
+                    "[orchestrator] %s timed out (attempt %d/%d): %s",
+                    agent.name, attempt + 1, self.max_retries + 1, e,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+
+            except MemoryUnavailableError as e:
+                # Infra issue — retry, might recover
+                logger.warning(
+                    "[orchestrator] %s memory unavailable (attempt %d/%d): %s",
+                    agent.name, attempt + 1, self.max_retries + 1, e,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+
+            except AgentError as e:
+                # Catch-all for other typed agent errors
                 logger.warning(
                     "[orchestrator] %s failed (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+
+            except Exception as e:
+                # Truly unexpected — log at error level, still retry
+                logger.error(
+                    "[orchestrator] %s unexpected error (attempt %d/%d): %s",
+                    agent.name, attempt + 1, self.max_retries + 1, e,
+                    exc_info=True,
                 )
                 if attempt < self.max_retries:
                     await asyncio.sleep(self.retry_delay * (attempt + 1))

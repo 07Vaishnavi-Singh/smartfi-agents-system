@@ -16,6 +16,8 @@ TS equivalent: abstract class BaseAgent { abstract analyze(...): Promise<string>
 Rust equivalent: trait BaseAgent { fn analyze(&self, ...) -> String; }
 """
 
+import asyncio
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -23,8 +25,15 @@ from abc import ABC, abstractmethod
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from investment_research_system.errors import (
+    LLMOutputError,
+    LLMRateLimitError,
+    LLMRefusalError,
+    LLMTimeoutError,
+    MemoryUnavailableError,
+)
 from investment_research_system.memory.manager import MemoryManager
-from investment_research_system.models.schemas import AgentResponse, Source
+from investment_research_system.models.schemas import AgentResponse, LLMStructuredResponse, Source
 from investment_research_system.tools.tavily_search import TavilySearch
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,38 @@ logger = logging.getLogger(__name__)
 # Used for tracking, not billing.
 COST_PER_INPUT_TOKEN = 3.0 / 1_000_000    # $3 per 1M input tokens
 COST_PER_OUTPUT_TOKEN = 15.0 / 1_000_000  # $15 per 1M output tokens
+
+# Timeout for a single LLM call. Claude can hang if the API has issues —
+# without this, the entire pipeline freezes indefinitely.
+LLM_CALL_TIMEOUT_SECONDS = 30
+
+# Appended to every system prompt so the LLM returns structured JSON.
+# The "status" field lets us detect refusals without fuzzy keyword matching.
+# If the LLM can't follow the format, we fall back to raw text (graceful degradation).
+STRUCTURED_OUTPUT_INSTRUCTION = """
+
+IMPORTANT — Response Format:
+You MUST respond with a JSON object in the following format. Do NOT include any text outside the JSON.
+
+{
+  "status": "completed",
+  "analysis": "<your full analysis here>"
+}
+
+If you cannot or should not answer the query (e.g., it asks for insider trading advice,
+specific buy/sell recommendations, or violates content policy), respond with:
+
+{
+  "status": "refused",
+  "refusal_reason": "<brief explanation of why you cannot answer>"
+}
+
+Rules:
+- "status" must be either "completed" or "refused"
+- For "completed": put your ENTIRE analysis in the "analysis" field
+- For "refused": explain why in "refusal_reason"
+- Do NOT wrap the JSON in markdown code blocks
+"""
 # PYTHON CONCEPT — underscores in numbers:
 # 1_000_000 == 1000000. Underscores are visual separators, ignored by Python.
 # TS equivalent: same! 1_000_000 works in TS too.
@@ -203,7 +244,10 @@ class BaseAgent(ABC):
         await self.memory.update_agent_status(session_id, self.name, "running")
 
         # Step 2: Search memory for past knowledge
-        memory_results = await self.memory.parallel_search(query)
+        try:
+            memory_results = await self.memory.parallel_search(query)
+        except Exception as e:
+            raise MemoryUnavailableError(self.name, f"Memory search failed: {e}") from e
         logger.info(
             "[%s] Memory search returned %d long-term, %d semantic results",
             self.name,
@@ -218,8 +262,13 @@ class BaseAgent(ABC):
         user_prompt = self.build_query(query, memory_results)
 
         # Step 5: Call Claude via LangChain
+        # Append structured output instruction to the system prompt so
+        # the LLM returns JSON with an explicit status field.
+        # This is done here (not in each agent's system_prompt) to keep
+        # it centralized — agents don't need to know about this.
+        full_system_prompt = self.system_prompt + STRUCTURED_OUTPUT_INSTRUCTION
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=full_system_prompt),
             HumanMessage(content=user_prompt),
         ]
 
@@ -227,9 +276,36 @@ class BaseAgent(ABC):
         # LangChain's async version of invoke(). Non-blocking.
         # `invoke()` = synchronous (blocks the event loop)
         # `ainvoke()` = asynchronous (other agents can run while waiting)
-        response: AIMessage = await self.llm.ainvoke(messages)
+        #
+        # TIMEOUT: Wraps the call with asyncio.timeout() so a hung API
+        # doesn't freeze the entire pipeline. Raises LLMTimeoutError
+        # instead of generic TimeoutError.
+        try:
+            async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
+                response: AIMessage = await self.llm.ainvoke(messages)
+        except TimeoutError:
+            raise LLMTimeoutError(
+                self.name,
+                f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS}s",
+            )
+        except Exception as e:
+            # Map known API errors to typed exceptions
+            error_msg = str(e).lower()
+            if "rate" in error_msg and "limit" in error_msg:
+                raise LLMRateLimitError(self.name, f"Rate limited: {e}") from e
+            if "429" in str(e):
+                raise LLMRateLimitError(self.name, f"Rate limited (429): {e}") from e
+            # Re-raise anything else — don't swallow unknown errors
+            raise
 
-        # Step 6: Calculate tokens and cost
+        # Validate response content
+        if not response.content or not response.content.strip():
+            raise LLMOutputError(self.name, "LLM returned empty response")
+
+        # Step 6: Parse structured response and check for refusal
+        analysis_content = self._parse_structured_response(response.content)
+
+        # Step 7: Calculate tokens and cost
         token_usage = response.usage_metadata or {}
         # PYTHON CONCEPT — duck typing:
         # We don't check the type of usage_metadata. We just call .get()
@@ -243,15 +319,15 @@ class BaseAgent(ABC):
 
         elapsed_ms = (time.time() - start_time) * 1000
 
-        # Step 7: Store results in memory for future queries
+        # Step 8: Store results in memory for future queries
         await self.memory.store_research(
-            content=response.content,
+            content=analysis_content,
             agent_name=self.name,
             session_id=session_id,
             metadata={"query_context": query},
         )
 
-        # Step 8: Update status to done
+        # Step 9: Update status to done
         await self.memory.update_agent_status(session_id, self.name, "done")
 
         logger.info(
@@ -261,8 +337,8 @@ class BaseAgent(ABC):
 
         return AgentResponse(
             agent_name=self.name,
-            content=response.content,
-            confidence=self._estimate_confidence(response.content, memory_results),
+            content=analysis_content,
+            confidence=self._estimate_confidence(analysis_content, memory_results),
             sources=sources,
             tokens_used=total_tokens,
             cost_usd=cost,
@@ -296,6 +372,94 @@ class BaseAgent(ABC):
 
         # Cap at 0.95 — never claim 100% confidence
         return min(score, 0.95)
+
+    def _parse_structured_response(self, raw_content: str) -> str:
+        """Parse structured JSON response from the LLM.
+
+        Extracts the analysis text and detects refusals via the status field.
+        Falls back to raw text if JSON parsing fails — the LLM might not
+        always follow the format, and we'd rather have unstructured output
+        than crash.
+
+        Args:
+            raw_content: The raw string response from the LLM.
+
+        Returns:
+            The analysis text (either from JSON or raw fallback).
+
+        Raises:
+            LLMRefusalError: If the LLM explicitly refused the query.
+            LLMOutputError: If JSON parsed but analysis field is empty.
+        """
+        # Strip markdown code fences if the LLM wrapped the JSON
+        content = raw_content.strip()
+        if content.startswith("```"):
+            # Remove ```json ... ``` or ``` ... ```
+            lines = content.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            content = "\n".join(lines).strip()
+
+        try:
+            parsed = LLMStructuredResponse.model_validate_json(content)
+        except (json.JSONDecodeError, ValueError):
+            # Graceful degradation: LLM didn't follow JSON format.
+            # This can happen on hard refusals (API-level content filter)
+            # where the model ignores our JSON instruction entirely.
+            # Check for raw-text refusal patterns ONLY on this fallback path.
+            # This is safe from false positives because structured responses
+            # (where Claude might say "I cannot confirm X" inside analysis)
+            # are handled above via the status field.
+            logger.debug(
+                "[%s] LLM response was not valid JSON, using raw content",
+                self.name,
+            )
+            self._check_raw_refusal(raw_content)
+            return raw_content
+
+        if parsed.status == "refused":
+            raise LLMRefusalError(
+                self.name,
+                f"LLM refused: {parsed.refusal_reason}",
+            )
+
+        if not parsed.analysis.strip():
+            raise LLMOutputError(
+                self.name,
+                "LLM returned completed status but empty analysis",
+            )
+
+        return parsed.analysis
+
+    def _check_raw_refusal(self, content: str) -> None:
+        """Detect hard refusals when the LLM ignored our JSON format.
+
+        Only called on the fallback path (JSON parsing failed), so these
+        patterns won't false-positive on structured responses where Claude
+        says things like "I cannot confirm this data" inside a completed analysis.
+
+        The check is deliberately strict: the response must be SHORT and
+        match a refusal pattern. Long responses are almost certainly real
+        analysis that just didn't follow the JSON format.
+
+        Raises:
+            LLMRefusalError: If the response looks like a hard refusal.
+        """
+        # Long responses are real content, not refusals
+        if len(content) > 300:
+            return
+
+        lower = content.lower()
+        # These only match when the ENTIRE short response is a refusal
+        refusal_signals = [
+            "i cannot assist",
+            "i'm not able to",
+            "i can't provide",
+            "i must decline",
+            "against my guidelines",
+            "i'm unable to help",
+        ]
+        if any(signal in lower for signal in refusal_signals):
+            raise LLMRefusalError(self.name, f"LLM refused (raw): {content[:200]}")
 
     def _format_memory_context(self, memory_results: dict) -> str:
         """Format memory search results into a readable string for the prompt.
