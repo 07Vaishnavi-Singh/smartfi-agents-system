@@ -22,7 +22,12 @@ class Settings(BaseSettings):
     postgres_url: str = "postgresql://agent_user:agent_pass@localhost:5432/agent_memory"
 
     # --- Model Settings ---
-    default_model: str = "claude-sonnet-4-20250514"
+    default_model: str = "gemini-3.1-flash-lite"
+    fallback_models: list[str] = [
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
     max_tokens: int = 4096
     temperature: float = 0.7
 

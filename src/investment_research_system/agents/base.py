@@ -124,6 +124,7 @@ class BaseAgent(ABC):
         llm: ChatAnthropic,
         memory: MemoryManager,
         tavily: TavilySearch | None = None,
+        fallback_llms: list | None = None,
     ):
         """Initialize with shared dependencies.
 
@@ -135,13 +136,15 @@ class BaseAgent(ABC):
         - Config lives in ONE place (whoever creates these objects)
 
         Args:
-            llm: LangChain ChatAnthropic instance (shared across agents).
+            llm: LangChain chat model instance (shared across agents).
             memory: MemoryManager for searching/storing research.
             tavily: Optional web search tool. Not all agents need it.
+            fallback_llms: Optional list of backup LLMs to try on rate limit.
         """
         self.llm = llm
         self.memory = memory
         self.tavily = tavily
+        self.fallback_llms = fallback_llms or []
 
     # =========================================================================
     # ABSTRACT PROPERTIES — subclasses MUST define these
@@ -289,31 +292,9 @@ class BaseAgent(ABC):
             HumanMessage(content=wrapped_prompt),
         ]
 
-        # PYTHON CONCEPT — ainvoke (async invoke):
-        # LangChain's async version of invoke(). Non-blocking.
-        # `invoke()` = synchronous (blocks the event loop)
-        # `ainvoke()` = asynchronous (other agents can run while waiting)
-        #
-        # TIMEOUT: Wraps the call with asyncio.timeout() so a hung API
-        # doesn't freeze the entire pipeline. Raises LLMTimeoutError
-        # instead of generic TimeoutError.
-        try:
-            async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
-                response: AIMessage = await self.llm.ainvoke(messages)
-        except TimeoutError:
-            raise LLMTimeoutError(
-                self.name,
-                f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS}s",
-            )
-        except Exception as e:
-            # Map known API errors to typed exceptions
-            error_msg = str(e).lower()
-            if "rate" in error_msg and "limit" in error_msg:
-                raise LLMRateLimitError(self.name, f"Rate limited: {e}") from e
-            if "429" in str(e):
-                raise LLMRateLimitError(self.name, f"Rate limited (429): {e}") from e
-            # Re-raise anything else — don't swallow unknown errors
-            raise
+        # Call LLM with automatic fallback on rate limits.
+        # Tries self.llm first, then each fallback model in order.
+        response: AIMessage = await self._call_llm_with_fallback(messages)
 
         # Validate response content
         if not response.content or not response.content.strip():
@@ -361,6 +342,65 @@ class BaseAgent(ABC):
             cost_usd=cost,
             latency_ms=elapsed_ms,
         )
+
+    async def _call_llm_with_fallback(self, messages: list) -> AIMessage:
+        """Call LLM with automatic fallback on rate limit errors.
+
+        Tries self.llm first, then each fallback in order.
+        Only falls back on rate limits (429) — other errors propagate immediately.
+
+        This is transparent to the orchestrator — it just gets a response
+        regardless of which model answered.
+
+        PYTHON CONCEPT — getattr(obj, attr, default):
+        Safely reads an attribute. If the object doesn't have it, returns default.
+        Used here because different LangChain chat models store the model name
+        in different attributes. getattr is like optional chaining in TS: obj?.attr ?? default
+        """
+        all_llms = [self.llm] + self.fallback_llms
+
+        for i, llm in enumerate(all_llms):
+            try:
+                async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
+                    response = await llm.ainvoke(messages)
+                if i > 0:
+                    model_name = getattr(llm, "model", "unknown")
+                    logger.info(
+                        "[%s] Fallback model #%d (%s) succeeded",
+                        self.name, i + 1, model_name,
+                    )
+                return response
+            except TimeoutError:
+                raise LLMTimeoutError(
+                    self.name,
+                    f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS}s",
+                )
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_rate_limit = (
+                    ("rate" in error_msg and "limit" in error_msg)
+                    or "429" in str(e)
+                    or "resource_exhausted" in error_msg
+                )
+
+                if is_rate_limit and i < len(all_llms) - 1:
+                    model_name = getattr(llm, "model", "unknown")
+                    logger.warning(
+                        "[%s] Model %s rate limited, falling back to next model",
+                        self.name, model_name,
+                    )
+                    continue
+
+                if is_rate_limit:
+                    raise LLMRateLimitError(
+                        self.name, f"All {len(all_llms)} models exhausted. Last error: {e}"
+                    ) from e
+
+                # Non-rate-limit error — propagate immediately
+                raise
+
+        # Should never reach here, but just in case
+        raise LLMRateLimitError(self.name, "All fallback models exhausted")
 
     def _estimate_confidence(self, content: str, memory_results: dict) -> float:
         """Estimate confidence based on response quality signals.
