@@ -1,3 +1,7 @@
+# Makefile runtime files
+.fastapi.pid
+.fastapi.log
+
 # Python-generated files
 __pycache__/
 *.py[oc]
