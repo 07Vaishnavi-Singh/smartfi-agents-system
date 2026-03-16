@@ -49,6 +49,57 @@ def get_orchestrator_factory():
     return create_orchestrator
 
 
+def create_llm(model: str, settings):
+    """Create LLM instance based on model name from config.
+
+    Factory pattern — the model string in config.py is the single source of truth.
+    This makes it trivial to switch models (e.g., cheaper models for low-priority
+    queries) without changing any agent code.
+
+    PYTHON CONCEPT — factory function:
+    Instead of hardcoding `ChatGoogleGenerativeAI(...)` everywhere, this function
+    inspects the model name and creates the right client. The rest of the code
+    just calls `create_llm()` and gets back a LangChain chat model.
+    TS equivalent: a factory function that returns different class instances
+    Rust equivalent: a builder pattern or enum-based construction
+
+    Args:
+        model: Model identifier string (e.g., "claude-sonnet-4-20250514", "gemini-2.5-flash-lite").
+        settings: Application settings with API keys and model parameters.
+
+    Returns:
+        A LangChain chat model instance.
+
+    Raises:
+        ValueError: If the model string doesn't match any supported provider.
+    """
+    import os
+
+    if "claude" in model:
+        from langchain_anthropic import ChatAnthropic
+
+        return ChatAnthropic(
+            model=model,
+            api_key=settings.anthropic_api_key,
+            max_tokens=settings.max_tokens,
+            temperature=settings.temperature,
+        )
+    elif "gemini" in model:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(
+            model=model,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            max_output_tokens=settings.max_tokens,
+            temperature=settings.temperature,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported model: {model}. "
+            f"Set DEFAULT_MODEL in .env to a 'claude-*' or 'gemini-*' model."
+        )
+
+
 def create_orchestrator():
     """Create a fresh orchestrator with all agents.
 
@@ -61,20 +112,7 @@ def create_orchestrator():
     TS equivalent: dynamic import() inside a function
     """
     try:
-        import os
-
-        from dotenv import load_dotenv
-
-        load_dotenv()
-
-        google_key = os.getenv("GOOGLE_API_KEY")
-        tavily_key = os.getenv("TAVILY_API_KEY")
-
-        if not google_key or not tavily_key:
-            logger.warning("[dependencies] Missing API keys — orchestrator unavailable")
-            return None
-
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        from config import settings
 
         from investment_research_system.agents.analyst import AnalystAgent
         from investment_research_system.agents.researcher import ResearcherAgent
@@ -83,34 +121,27 @@ def create_orchestrator():
         from investment_research_system.orchestrator.graph import ResearchOrchestrator
         from investment_research_system.tools.tavily_search import TavilySearch
 
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite",
-            google_api_key=google_key,
-            max_output_tokens=1024,
-            temperature=0.7,
-        )
+        # Create LLM from config — no more hardcoded model names
+        llm = create_llm(settings.default_model, settings)
+        logger.info("[dependencies] LLM created: %s", settings.default_model)
 
         # Real MemoryManager — connects to Redis, Qdrant, Mem0, and optionally Postgres
-        from investment_research_system.memory.manager import MemoryManager
-        from investment_research_system.memory.short_term import ShortTermMemory
         from investment_research_system.memory.long_term import LongTermMemory
+        from investment_research_system.memory.manager import MemoryManager
         from investment_research_system.memory.semantic import SemanticMemory
+        from investment_research_system.memory.short_term import ShortTermMemory
 
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-
-        short_term = ShortTermMemory(redis_url=redis_url)
-        long_term = LongTermMemory(qdrant_url=qdrant_url)
+        short_term = ShortTermMemory(redis_url=settings.redis_url)
+        long_term = LongTermMemory(qdrant_url=settings.qdrant_url)
         semantic = SemanticMemory()
 
         # Postgres is optional — if it's not running, memory still works without it
         episodic = None
-        postgres_url = os.getenv("POSTGRES_URL", "postgresql://agent_user:agent_pass@localhost:5432/agent_memory")
         try:
             from investment_research_system.memory.database import create_tables, get_engine, get_session_factory
             from investment_research_system.memory.episodic import EpisodicMemory
 
-            engine = get_engine(postgres_url)
+            engine = get_engine(settings.postgres_url)
             create_tables(engine)
             session_factory = get_session_factory(engine)
             episodic = EpisodicMemory(session_factory=session_factory)
@@ -125,7 +156,7 @@ def create_orchestrator():
             episodic=episodic,
         )
 
-        tavily = TavilySearch(api_key=tavily_key)
+        tavily = TavilySearch(api_key=settings.tavily_api_key)
 
         agents = [
             ResearcherAgent(llm=llm, memory=memory, tavily=tavily),

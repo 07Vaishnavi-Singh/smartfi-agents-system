@@ -26,7 +26,9 @@ from pydantic import BaseModel, Field
 
 from investment_research_system.api.dependencies import get_job_store, get_orchestrator_factory
 from investment_research_system.api.job_store import JobStore
+from investment_research_system.errors import PromptInjectionError
 from investment_research_system.models.schemas import ResearchDepth
+from investment_research_system.security.input_guard import sanitize_query
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,13 @@ async def create_research(
     get_job_store() and passes the result as 'store'.
     TS equivalent: @Inject() in NestJS
     """
+    # SECURITY — Layer 1: Check for prompt injection before any LLM call.
+    # Catches known attack patterns early, returns 400 immediately.
+    try:
+        sanitize_query(request.query)
+    except PromptInjectionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     job_id = store.create(query=request.query)
 
     background_tasks.add_task(_run_research_job, job_id, request, store, orchestrator_factory)
