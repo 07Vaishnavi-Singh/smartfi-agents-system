@@ -1,6 +1,8 @@
 # Makefile runtime files
 .fastapi.pid
 .fastapi.log
+.streamlit.pid
+.streamlit.log
 
 # Python-generated files
 __pycache__/
