@@ -19,7 +19,7 @@ up:
 	@echo "  API Docs:  localhost:8000/docs"
 	@echo "  Streamlit: localhost:8501"
 	@echo ""
-	@echo "Logs: make logs-api | make logs-ui | make logs"
+	@echo "Logs: make logs-api | make logs-ui"
 
 # Stop everything: Streamlit + FastAPI + Docker containers
 down:
