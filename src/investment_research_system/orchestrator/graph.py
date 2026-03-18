@@ -53,7 +53,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from investment_research_system.agents.base import BaseAgent
+from investment_research_system.agents.base import LLM_CALL_TIMEOUT_SECONDS, BaseAgent
 from investment_research_system.errors import (
     AgentError,
     BudgetExceededError,
@@ -169,7 +169,7 @@ class OrchestratorState(TypedDict):
     research_query: ResearchQuery                 # parsed query with settings
     session_id: str                               # unique session ID
     agent_responses: list[AgentResponse]          # collected responses
-    failed_agents: list[str]                      # agents that couldn't respond
+    failed_agents: list[dict]                      # agents that couldn't respond (with error details)
     conflicts: list[dict]                         # disagreements between agents
     quality: QualityAssessment | None             # quality grade
     report: ResearchReport | None                 # final output
@@ -264,7 +264,9 @@ class ResearchOrchestrator:
     # SHARED HELPER
     # =========================================================================
 
-    async def _run_agent_with_retry(self, agent: BaseAgent, query: str, session_id: str) -> AgentResponse | None:
+    async def _run_agent_with_retry(
+        self, agent: BaseAgent, query: str, session_id: str,
+    ) -> tuple[AgentResponse | None, dict | None]:
         """Run a single agent with retry + circuit breaker + typed error handling.
 
         Uses the error hierarchy to make intelligent recovery decisions:
@@ -273,30 +275,50 @@ class ResearchOrchestrator:
         - Memory unavailable → retry (transient infra issue)
         - Unknown error → retry (might be transient)
 
-        Returns None if the agent fails after all retries.
+        Returns a tuple of (response, failure_info).
+        On success: (AgentResponse, None)
+        On failure: (None, {"agent": str, "error_type": str, "error_message": str})
         """
         if not self.circuit_breaker.can_call(agent.name):
             logger.warning("[orchestrator] Skipping %s — circuit breaker OPEN", agent.name)
-            return None
+            return None, {
+                "agent": agent.name,
+                "error_type": "circuit_breaker",
+                "error_message": "Skipped — too many recent failures (circuit breaker open)",
+            }
+
+        # Track the last error so we can report it if all retries fail
+        last_error_type = "unknown"
+        last_error_message = "Unknown error"
 
         for attempt in range(self.max_retries + 1):
             try:
                 response = await agent.run(query, session_id)
                 self.circuit_breaker.record_success(agent.name)
-                return response
+                return response, None
 
             except BudgetExceededError:
                 # Hard stop — retrying or switching providers won't help
                 logger.info("[orchestrator] %s hit budget limit, stopping", agent.name)
-                return None
+                return None, {
+                    "agent": agent.name,
+                    "error_type": "budget_exceeded",
+                    "error_message": "Stopped — query exceeded its allocated cost budget",
+                }
 
             except LLMRefusalError as e:
                 # Model won't answer this — retrying is pointless
                 logger.warning("[orchestrator] %s refused query: %s", agent.name, e)
-                return None
+                return None, {
+                    "agent": agent.name,
+                    "error_type": "refused",
+                    "error_message": "Model refused to answer this query",
+                }
 
             except LLMRateLimitError as e:
                 # Backoff harder on rate limits (exponential)
+                last_error_type = "rate_limit"
+                last_error_message = "Rate limited by LLM provider"
                 logger.warning(
                     "[orchestrator] %s rate limited (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
@@ -307,6 +329,8 @@ class ResearchOrchestrator:
 
             except LLMTimeoutError as e:
                 # Transient — retry with linear backoff
+                last_error_type = "timeout"
+                last_error_message = f"Timed out after {LLM_CALL_TIMEOUT_SECONDS}s (retried {self.max_retries + 1} times)"
                 logger.warning(
                     "[orchestrator] %s timed out (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
@@ -316,6 +340,8 @@ class ResearchOrchestrator:
 
             except MemoryUnavailableError as e:
                 # Infra issue — retry, might recover
+                last_error_type = "memory_unavailable"
+                last_error_message = "Memory backend (Redis/Qdrant) unreachable"
                 logger.warning(
                     "[orchestrator] %s memory unavailable (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
@@ -325,6 +351,8 @@ class ResearchOrchestrator:
 
             except AgentError as e:
                 # Catch-all for other typed agent errors
+                last_error_type = "agent_error"
+                last_error_message = str(e)
                 logger.warning(
                     "[orchestrator] %s failed (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
@@ -334,6 +362,8 @@ class ResearchOrchestrator:
 
             except Exception as e:
                 # Truly unexpected — log at error level, still retry
+                last_error_type = "unexpected"
+                last_error_message = f"Unexpected error: {type(e).__name__}"
                 logger.error(
                     "[orchestrator] %s unexpected error (attempt %d/%d): %s",
                     agent.name, attempt + 1, self.max_retries + 1, e,
@@ -344,17 +374,22 @@ class ResearchOrchestrator:
 
         # All retries exhausted
         self.circuit_breaker.record_failure(agent.name)
-        return None
+        return None, {
+            "agent": agent.name,
+            "error_type": last_error_type,
+            "error_message": last_error_message,
+        }
 
     async def _run_agents_parallel(
         self, agents: dict[str, BaseAgent], query: str, session_id: str,
-    ) -> tuple[list[AgentResponse], list[str]]:
-        """Run a group of agents in parallel, return responses + failures.
+    ) -> tuple[list[AgentResponse], list[dict]]:
+        """Run a group of agents in parallel, return responses + failure details.
 
         PYTHON CONCEPT — tuple return:
         Returns two values as a tuple: (responses, failed_agents).
+        failed_agents is a list of dicts with keys: agent, error_type, error_message.
         TS equivalent: return [responses, failedAgents] with destructuring.
-        Rust equivalent: (Vec<AgentResponse>, Vec<String>)
+        Rust equivalent: (Vec<AgentResponse>, Vec<FailureInfo>)
         """
         results = await asyncio.gather(
             *[self._run_agent_with_retry(agent, query, session_id) for agent in agents.values()],
@@ -362,13 +397,12 @@ class ResearchOrchestrator:
 
         responses = []
         failed = []
-        agent_names = list(agents.keys())
 
-        for i, result in enumerate(results):
-            if result is not None:
-                responses.append(result)
-            else:
-                failed.append(agent_names[i])
+        for response, failure_info in results:
+            if response is not None:
+                responses.append(response)
+            elif failure_info is not None:
+                failed.append(failure_info)
 
         return responses, failed
 
@@ -462,32 +496,49 @@ class ResearchOrchestrator:
         return {"quality": quality}
 
     async def _node_build_report(self, state: OrchestratorState) -> dict:
-        """Node 5: Combine everything into a final ResearchReport."""
+        """Node 5: Synthesize all agent outputs into a coherent summary via LLM.
+
+        Instead of dumb truncation, we pass all agent outputs to the LLM
+        and ask it to produce a unified investment research summary with
+        citations. This is one extra LLM call — much cheaper than a full
+        agent pipeline (no memory search, no web search, no source gathering).
+        """
         elapsed = time.time() - state["start_time"]
 
-        # Build the summary from agent responses
-        summary_parts = []
-
+        # Build context from all agent responses for the synthesis prompt
+        agent_outputs = []
         for response in state["agent_responses"]:
-            summary_parts.append(f"**{response.agent_name}:** {response.content[:200]}...")
+            agent_outputs.append(
+                f"=== {response.agent_name.upper()} ===\n"
+                f"Confidence: {response.confidence:.2f}\n"
+                f"{response.content}"
+            )
 
-        # Add conflict info
         conflicts_text = format_conflicts_summary(state["conflicts"])
-        # Add quality info
         quality_text = format_quality_summary(state["quality"])
 
-        summary = "\n\n".join(summary_parts)
-        summary += f"\n\n---\n{conflicts_text}\n\n{quality_text}"
-
-        # Calculate totals
+        # Calculate totals before the synthesis call
         total_tokens = sum(r.tokens_used for r in state["agent_responses"])
         total_cost = sum(r.cost_usd for r in state["agent_responses"])
+
+        # Try LLM-powered synthesis, fall back to basic concatenation if it fails
+        summary = await self._synthesize_summary(
+            query=state["query"],
+            agent_outputs=agent_outputs,
+            conflicts_text=conflicts_text,
+            quality_text=quality_text,
+        )
+
+        # Add synthesis tokens/cost to totals
+        total_tokens += self._last_synthesis_tokens
+        total_cost += self._last_synthesis_cost
 
         report = ResearchReport(
             id=str(uuid4()),
             query=state["research_query"],
             summary=summary,
             agent_responses=state["agent_responses"],
+            failed_agents=state["failed_agents"],
             total_cost_usd=total_cost,
             total_tokens=total_tokens,
             processing_time_seconds=round(elapsed, 2),
@@ -499,6 +550,86 @@ class ResearchOrchestrator:
         )
 
         return {"report": report}
+
+    async def _synthesize_summary(
+        self,
+        query: str,
+        agent_outputs: list[str],
+        conflicts_text: str,
+        quality_text: str,
+    ) -> str:
+        """Use the LLM to synthesize agent outputs into a coherent summary.
+
+        Grabs the LLM from the first available agent (they all share the same
+        LLM instance). Falls back to basic concatenation if the LLM call fails.
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        self._last_synthesis_tokens = 0
+        self._last_synthesis_cost = 0
+
+        # Grab LLM from any agent — they all share the same instance
+        any_agent = next(iter(self.agents.values()), None)
+        if not any_agent:
+            return self._fallback_summary(agent_outputs, conflicts_text, quality_text)
+
+        system_prompt = """You are a senior investment research editor. Your job is to synthesize
+multiple analyst reports into ONE coherent, well-structured research summary.
+
+Rules:
+- Write in clear, professional financial language
+- Structure with sections: Key Findings, Analysis, Risks, Recommendation
+- When agents disagree, present both views and explain the tension
+- Cite which agent provided each insight (e.g. "per the risk assessment...")
+- Keep it concise but thorough — aim for 300-500 words
+- Do NOT add information that wasn't in the agent reports
+- End with a clear, balanced conclusion"""
+
+        human_prompt = f"""Original question: {query}
+
+Here are the reports from our specialized agents:
+
+{"".join(f"{output}" + chr(10) + chr(10) for output in agent_outputs)}
+{conflicts_text}
+
+{quality_text}
+
+Synthesize these into a single coherent research summary."""
+
+        try:
+            # Use the primary LLM (with fallback chain if available)
+            response = await any_agent._call_llm_with_fallback([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=human_prompt),
+            ])
+
+            # Track synthesis cost
+            usage = response.usage_metadata or {}
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            self._last_synthesis_tokens = input_tokens + output_tokens
+            # Use approximate Gemini pricing (much cheaper than Claude)
+            self._last_synthesis_cost = (input_tokens + output_tokens) * 0.5 / 1_000_000
+
+            logger.info(
+                "[orchestrator] Synthesis complete: %d tokens",
+                self._last_synthesis_tokens,
+            )
+            return response.content
+
+        except Exception as e:
+            logger.warning(
+                "[orchestrator] LLM synthesis failed, using fallback: %s", e,
+            )
+            return self._fallback_summary(agent_outputs, conflicts_text, quality_text)
+
+    def _fallback_summary(
+        self, agent_outputs: list[str], conflicts_text: str, quality_text: str,
+    ) -> str:
+        """Basic concatenation fallback if LLM synthesis fails."""
+        summary = "\n\n".join(agent_outputs)
+        summary += f"\n\n---\n{conflicts_text}\n\n{quality_text}"
+        return summary
 
     # =========================================================================
     # PUBLIC API

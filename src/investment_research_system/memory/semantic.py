@@ -44,10 +44,14 @@ class SemanticMemory:
         Mem0 config can specify which LLM/embedding to use.
         None = use Mem0's defaults.
         """
-        if config:
-            self.memory = Memory.from_config(config)
-        else:
-            self.memory = Memory()
+        if not config:
+            config = {
+                "embedder": {
+                    "provider": "huggingface",
+                    "config": {"model": "all-MiniLM-L6-v2"},
+                },
+            }
+        self.memory = Memory.from_config(config)
 
         logger.info("Semantic memory (Mem0) initialized")
 
@@ -101,8 +105,7 @@ class SemanticMemory:
             # same as: self.memory.search(query="NVIDIA", limit=5)
         """
         kwargs: dict = {"query": query, "limit": limit}
-        if agent_name:
-            kwargs["user_id"] = agent_name
+        kwargs["user_id"] = agent_name or "system"
 
         results = self.memory.search(**kwargs)
         return results.get("results", [])

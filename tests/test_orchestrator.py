@@ -122,10 +122,11 @@ def test_quality_assessment():
 
     # 3 responses — should be MEDIUM
     partial = full[:3]
-    result = assess_quality(partial, [], failed_agents=["sentiment"])
+    failed = [{"agent": "sentiment", "error_type": "timeout", "error_message": "Timed out after 30s"}]
+    result = assess_quality(partial, [], failed_agents=failed)
     assert result.grade == "MEDIUM"
     assert result.passed is True
-    assert any("unavailable" in d for d in result.disclaimers)
+    assert any("unavailable" in d or "sentiment" in d for d in result.disclaimers)
     print(f"3 agents → grade: {result.grade}, disclaimers: {result.disclaimers}")
 
     # 1 response — should be MINIMAL

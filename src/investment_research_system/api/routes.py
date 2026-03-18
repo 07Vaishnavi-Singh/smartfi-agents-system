@@ -18,6 +18,7 @@ work happens in the background. Like Node's setImmediate or queueMicrotask,
 but for long-running work.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -100,7 +101,9 @@ async def _run_research_job(
     try:
         from investment_research_system.models.schemas import ResearchQuery
 
-        orchestrator = orchestrator_factory()
+        # Build orchestrator off the event loop so heavy model/memory init
+        # doesn't block /health and /research/{job_id} polling requests.
+        orchestrator = await asyncio.to_thread(orchestrator_factory)
         if orchestrator is None:
             store.update(
                 job_id,

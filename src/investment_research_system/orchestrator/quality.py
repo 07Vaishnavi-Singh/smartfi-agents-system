@@ -49,17 +49,38 @@ class QualityAssessment:
     passed: bool                  # is this report good enough to return?
 
 
+def _format_failure_reason(failure: dict) -> str:
+    """Format a single agent failure into a readable string."""
+    agent = failure.get("agent", "unknown")
+    error_type = failure.get("error_type", "unknown")
+    error_message = failure.get("error_message", "Unknown error")
+
+    # Map error types to user-friendly labels
+    type_labels = {
+        "timeout": "timed out",
+        "rate_limit": "rate limited",
+        "refused": "refused query",
+        "budget_exceeded": "budget exceeded",
+        "memory_unavailable": "memory unavailable",
+        "circuit_breaker": "circuit breaker open",
+        "agent_error": "failed",
+        "unexpected": "unexpected error",
+    }
+    label = type_labels.get(error_type, "failed")
+    return f"{agent} {label}: {error_message}"
+
+
 def assess_quality(
     responses: list[AgentResponse],
     conflicts: list[dict],
-    failed_agents: list[str] | None = None,
+    failed_agents: list[dict] | None = None,
 ) -> QualityAssessment:
     """Evaluate the quality of the research output.
 
     Args:
         responses: Agent responses we received.
         conflicts: Conflicts detected between agents.
-        failed_agents: Names of agents that failed (for disclaimers).
+        failed_agents: Dicts with keys: agent, error_type, error_message.
 
     Returns:
         QualityAssessment with grade, disclaimers, and pass/fail.
@@ -74,13 +95,17 @@ def assess_quality(
     else:
         average_confidence = 0.0
 
+    # Build per-agent failure details for disclaimers
+    failure_details = [_format_failure_reason(f) for f in failed_agents]
+    failed_names = [f.get("agent", "unknown") for f in failed_agents]
+
     # Determine grade based on agent count
     if agent_count >= 4:
         grade = "HIGH"
     elif agent_count == 3:
         grade = "MEDIUM"
         disclaimers.append(
-            f"1 agent unavailable ({', '.join(failed_agents) or 'unknown'}). "
+            f"1 agent unavailable ({', '.join(failed_names) or 'unknown'}). "
             "Report may be missing some perspective."
         )
     elif agent_count == 2:
@@ -98,6 +123,10 @@ def assess_quality(
     else:
         grade = "FAILED"
         disclaimers.append("No agents were able to produce analysis.")
+
+    # Add specific failure reasons as individual disclaimers
+    for detail in failure_details:
+        disclaimers.append(detail)
 
     # Downgrade if average confidence is low
     if average_confidence < 0.4 and grade in ("HIGH", "MEDIUM"):

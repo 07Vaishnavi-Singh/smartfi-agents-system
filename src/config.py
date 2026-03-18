@@ -11,10 +11,11 @@ class Settings(BaseSettings):
     This is enforced by ruff (your linter).
     """
 
-    # --- API Keys (required — app crashes on startup if missing) ---
-    anthropic_api_key: str
-    tavily_api_key: str
-    # langsmith_api_key: str
+    # --- API Keys ---
+    anthropic_api_key: str = ""
+    google_api_key: str = ""
+    tavily_api_key: str = ""
+    langsmith_api_key: str = ""
 
     # --- Infrastructure URLs ---
     redis_url: str = "redis://localhost:6379"
@@ -22,7 +23,12 @@ class Settings(BaseSettings):
     postgres_url: str = "postgresql://agent_user:agent_pass@localhost:5432/agent_memory"
 
     # --- Model Settings ---
-    default_model: str = "claude-sonnet-4-20250514"
+    default_model: str = "gemini-3.1-flash-lite"
+    fallback_models: list[str] = [
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
     max_tokens: int = 4096
     temperature: float = 0.7
 

@@ -37,6 +37,9 @@ down:
 	else \
 		echo "No FastAPI PID file found, skipping..."; \
 	fi
+	@# Safety net: kill anything still holding the ports
+	@lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+	@lsof -ti:8501 | xargs kill -9 2>/dev/null || true
 	docker compose down
 	@echo "All services stopped."
 

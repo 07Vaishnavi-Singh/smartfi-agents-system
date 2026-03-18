@@ -77,6 +77,7 @@ class ResearchReport(BaseModel):
     query: ResearchQuery                                   # original question
     summary: str                                           # executive summary
     agent_responses: list[AgentResponse]                   # individual agent outputs
+    failed_agents: list[dict] = Field(default_factory=list)  # agents that failed with error details
     total_cost_usd: float = Field(default=0.0, ge=0.0)
     total_tokens: int = Field(default=0, ge=0)
     processing_time_seconds: float = Field(default=0.0, ge=0.0)

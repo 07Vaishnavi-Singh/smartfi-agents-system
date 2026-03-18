@@ -173,6 +173,13 @@ class LongTermMemory:
         logger.info("Stored in Qdrant: %s (id: %s)", text[:80], point_id)
         return point_id
 
+    # Minimum cosine similarity to include a result.
+    # With all-MiniLM-L6-v2, scores roughly mean:
+    #   0.7+ = very similar topic, 0.5-0.7 = related, <0.5 = weakly related
+    # 0.7 ensures only closely related past research is retrieved,
+    # filtering out cross-topic bleed (e.g., ICICI results for a gold query).
+    SCORE_THRESHOLD = 0.7
+
     def search(self, query: str, limit: int = 5, agent_name: str | None = None) -> list[dict]:
         """Find semantically similar past research.
 
@@ -198,6 +205,7 @@ class LongTermMemory:
             query=query_vector,
             query_filter=query_filter,
             limit=limit,
+            score_threshold=self.SCORE_THRESHOLD,
         )
 
         # PYTHON CONCEPT — list comprehension with transformation:

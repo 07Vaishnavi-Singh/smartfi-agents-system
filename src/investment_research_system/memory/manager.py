@@ -108,13 +108,22 @@ class MemoryManager:
         the event loop. This is how you mix sync + async code in Python.
         TS doesn't need this because everything is async by default.
         """
-        # Run both searches in parallel using thread pool for sync clients
+        # Run both searches in parallel. Treat each backend as optional:
+        # a Mem0 dimension/config issue should not block all agent analysis.
         qdrant_results, mem0_results = await asyncio.gather(
             asyncio.to_thread(self.long_term.search, query),
             asyncio.to_thread(self.semantic.search, query),
+            return_exceptions=True,
             # ^ to_thread(function, arg1, arg2) runs the sync function
             #   in a separate thread, returning an awaitable.
         )
+
+        if isinstance(qdrant_results, Exception):
+            logger.warning("Long-term memory search failed: %s", qdrant_results)
+            qdrant_results = []
+        if isinstance(mem0_results, Exception):
+            logger.warning("Semantic memory search failed: %s", mem0_results)
+            mem0_results = []
 
         logger.info(
             "Parallel search complete: %d from Qdrant, %d from Mem0",
@@ -157,10 +166,17 @@ class MemoryManager:
         # ^ merges the two dicts. metadata values override if keys conflict.
 
         # Store in Qdrant (long-term — embedded with contextual enrichment)
-        await asyncio.to_thread(self.long_term.store, content, storage_metadata)
+        # and Mem0 (semantic) independently so one backend failure doesn't
+        # prevent returning agent output.
+        try:
+            await asyncio.to_thread(self.long_term.store, content, storage_metadata)
+        except Exception as e:
+            logger.warning("Long-term memory store failed for %s: %s", agent_name, e)
 
-        # Store in Mem0 (semantic — auto-extracts facts)
-        await asyncio.to_thread(self.semantic.store, content, agent_name, storage_metadata)
+        try:
+            await asyncio.to_thread(self.semantic.store, content, agent_name, storage_metadata)
+        except Exception as e:
+            logger.warning("Semantic memory store failed for %s: %s", agent_name, e)
 
         # Update session with latest result
         await self.short_term.store(

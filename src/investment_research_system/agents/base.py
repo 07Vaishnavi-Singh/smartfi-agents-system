@@ -492,12 +492,15 @@ class BaseAgent(ABC):
 
         long_term = memory_results.get("long_term", [])
         if long_term:
-            parts.append("=== Past Research ===")
-            for item in long_term[:3]:
-                # Only include top 3 most relevant results
-                text = item.get("text", "")
-                score = item.get("score", 0)
-                parts.append(f"[relevance: {score:.2f}] {text[:300]}")
+            # Filter out low-relevance results that slipped through
+            # (e.g., ICICI research when asking about gold)
+            relevant = [item for item in long_term if item.get("score", 0) >= 0.7]
+            if relevant:
+                parts.append("=== Past Research ===")
+                for item in relevant[:3]:
+                    text = item.get("text", "")
+                    score = item.get("score", 0)
+                    parts.append(f"[relevance: {score:.2f}] {text[:300]}")
 
         semantic = memory_results.get("semantic", [])
         if semantic:

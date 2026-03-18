@@ -161,7 +161,7 @@ def submit_research(query: str, focus_areas: list[str], depth: str) -> dict:
 
 def get_job_status(job_id: str) -> dict:
     """GET /research/{job_id} and return the response."""
-    r = httpx.get(f"{API_BASE}/research/{job_id}", timeout=10)
+    r = httpx.get(f"{API_BASE}/research/{job_id}", timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -276,6 +276,36 @@ def render_report(report: dict) -> None:
         st.markdown("### Executive Summary")
         st.markdown(summary)
 
+    # --- Failed agents ---
+    failed_agents = report.get("failed_agents", [])
+    if failed_agents:
+        st.markdown("### Agent Failures")
+        for failure in failed_agents:
+            agent_name = failure.get("agent", "unknown")
+            error_type = failure.get("error_type", "unknown")
+            error_message = failure.get("error_message", "Unknown error")
+            info = AGENT_DISPLAY.get(
+                agent_name, {"label": agent_name, "icon": "🤖", "color": "#888"},
+            )
+
+            # Map error types to user-friendly icons
+            error_icons = {
+                "timeout": "⏱️",
+                "rate_limit": "🚦",
+                "refused": "🚫",
+                "budget_exceeded": "💰",
+                "memory_unavailable": "🗄️",
+                "circuit_breaker": "⚡",
+                "agent_error": "❌",
+                "unexpected": "⚠️",
+            }
+            error_icon = error_icons.get(error_type, "❌")
+
+            st.warning(
+                f"{error_icon} **{info['label']}** — {error_message}",
+                icon=None,
+            )
+
     # --- Agent responses ---
     st.markdown("### Agent Analysis")
     agent_order = ["researcher", "sentiment", "analyst", "risk_assessor"]
@@ -386,6 +416,8 @@ if submitted:
             st.error(f"API error: {e.response.status_code} — {e.response.text}")
         except httpx.ConnectError:
             st.error("Cannot connect to API. Is the backend running?")
+        except httpx.TimeoutException:
+            st.error("API timed out while creating the research job. Please retry.")
 
 # --- Active job display ---
 if st.session_state.active_job:
@@ -401,6 +433,10 @@ if st.session_state.active_job:
     except httpx.ConnectError:
         st.error("Lost connection to API.")
         st.stop()
+    except httpx.TimeoutException:
+        st.warning("API is slow right now. Retrying job status...")
+        time.sleep(POLL_INTERVAL)
+        st.rerun()
 
     status = job["status"]
 
