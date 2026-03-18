@@ -125,6 +125,17 @@ def create_orchestrator():
         llm = create_llm(settings.default_model, settings)
         logger.info("[dependencies] LLM created: %s", settings.default_model)
 
+        # Create fallback LLMs from config — tried in order on rate limit
+        fallback_llms = []
+        for model_name in settings.fallback_models:
+            if model_name != settings.default_model:
+                try:
+                    fallback_llm = create_llm(model_name, settings)
+                    fallback_llms.append(fallback_llm)
+                except Exception as e:
+                    logger.warning("[dependencies] Could not create fallback model %s: %s", model_name, e)
+        logger.info("[dependencies] Fallback chain: %s → %s", settings.default_model, [getattr(l, "model", "?") for l in fallback_llms])
+
         # Real MemoryManager — connects to Redis, Qdrant, Mem0, and optionally Postgres
         from investment_research_system.memory.long_term import LongTermMemory
         from investment_research_system.memory.manager import MemoryManager
@@ -159,10 +170,10 @@ def create_orchestrator():
         tavily = TavilySearch(api_key=settings.tavily_api_key)
 
         agents = [
-            ResearcherAgent(llm=llm, memory=memory, tavily=tavily),
-            AnalystAgent(llm=llm, memory=memory, tavily=tavily),
-            RiskAssessorAgent(llm=llm, memory=memory, tavily=tavily),
-            SentimentAgent(llm=llm, memory=memory, tavily=tavily),
+            ResearcherAgent(llm=llm, memory=memory, tavily=tavily, fallback_llms=fallback_llms),
+            AnalystAgent(llm=llm, memory=memory, tavily=tavily, fallback_llms=fallback_llms),
+            RiskAssessorAgent(llm=llm, memory=memory, tavily=tavily, fallback_llms=fallback_llms),
+            SentimentAgent(llm=llm, memory=memory, tavily=tavily, fallback_llms=fallback_llms),
         ]
 
         return ResearchOrchestrator(agents=agents, max_retries=1)
