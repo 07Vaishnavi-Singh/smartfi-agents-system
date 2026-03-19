@@ -337,11 +337,13 @@ class BaseAgent(ABC):
         elapsed_ms = (time.time() - start_time) * 1000
 
         # Step 8: Store results in memory for future queries
+        # Pass topics so the stored research is tagged for future topic-filtered retrieval.
         await self.memory.store_research(
             content=analysis_content,
             agent_name=self.name,
             session_id=session_id,
             metadata={"query_context": query},
+            topics=memory_results.get("topics"),
         )
 
         # Step 9: Update status to done
