@@ -22,6 +22,7 @@ from investment_research_system.memory.episodic import EpisodicMemory
 from investment_research_system.memory.long_term import LongTermMemory
 from investment_research_system.memory.semantic import SemanticMemory
 from investment_research_system.memory.short_term import ShortTermMemory
+from investment_research_system.memory.topic_extractor import extract_topics
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +91,17 @@ class MemoryManager:
     # =========================================================================
 
     async def parallel_search(self, query: str) -> dict:
-        """Search all memory types simultaneously.
+        """Search all memory types simultaneously, with topic-based filtering.
 
         This is the PARALLEL-FIRST strategy:
-        - Fire Qdrant + Mem0 at the same time
-        - Don't wait for one before starting the other
+        - Extract topics from the query (instant keyword matching)
+        - Fire Qdrant (topic-filtered) + Mem0 at the same time
         - Agent evaluates results AFTER both return
+
+        Topic filtering prevents context contamination: if you ask about gold,
+        only research tagged with ["gold", "commodities"] is searched in Qdrant.
+        ICICI research (tagged "indian_equities") is structurally excluded —
+        it never enters the similarity ranking.
 
         PYTHON CONCEPT — asyncio.gather():
         Runs multiple async functions concurrently (not sequentially).
@@ -108,23 +114,40 @@ class MemoryManager:
         the event loop. This is how you mix sync + async code in Python.
         TS doesn't need this because everything is async by default.
         """
-        # Run both searches in parallel using thread pool for sync clients
+        # Step 1: Extract topics from the query (instant, no LLM call)
+        topics = extract_topics(query)
+        logger.info("Query topics: %s for query: %s", topics, query[:80])
+
+        # Step 2: Run both searches in parallel. Treat each backend as optional:
+        # a Mem0 dimension/config issue should not block all agent analysis.
+        # Qdrant gets topic-filtered; Mem0 doesn't support topic filtering
+        # natively (it uses its own fact-matching), so it searches broadly.
         qdrant_results, mem0_results = await asyncio.gather(
-            asyncio.to_thread(self.long_term.search, query),
+            asyncio.to_thread(self.long_term.search, query, 5, None, topics),
             asyncio.to_thread(self.semantic.search, query),
+            return_exceptions=True,
             # ^ to_thread(function, arg1, arg2) runs the sync function
             #   in a separate thread, returning an awaitable.
         )
 
+        if isinstance(qdrant_results, Exception):
+            logger.warning("Long-term memory search failed: %s", qdrant_results)
+            qdrant_results = []
+        if isinstance(mem0_results, Exception):
+            logger.warning("Semantic memory search failed: %s", mem0_results)
+            mem0_results = []
+
         logger.info(
-            "Parallel search complete: %d from Qdrant, %d from Mem0",
+            "Parallel search complete: %d from Qdrant, %d from Mem0 (topics: %s)",
             len(qdrant_results),
             len(mem0_results),
+            topics,
         )
 
         return {
-            "long_term": qdrant_results,    # past research chunks
+            "long_term": qdrant_results,    # past research chunks (topic-filtered)
             "semantic": mem0_results,        # agent-level facts
+            "topics": topics,               # pass topics downstream for storage
         }
 
     # =========================================================================
@@ -137,13 +160,22 @@ class MemoryManager:
         agent_name: str,
         session_id: str,
         metadata: dict | None = None,
+        topics: list[str] | None = None,
     ) -> None:
         """Store research results across all relevant memory types.
 
         Called after an agent produces output:
-        1. Qdrant: store the full research text (for future semantic search)
+        1. Qdrant: store the full research text with topic tags (for future semantic search)
         2. Mem0: store extracted facts (for agent-level knowledge)
         3. Redis: update session with latest results
+
+        Args:
+            content: The research text to store.
+            agent_name: Which agent produced this.
+            session_id: Current session ID.
+            metadata: Extra metadata (query_context, etc.).
+            topics: Topic tags extracted from the query (e.g., ["gold", "commodities"]).
+                    Stored in Qdrant payload for future topic-filtered retrieval.
 
         PYTHON CONCEPT — dict merging with `|` operator (Python 3.9+):
         dict1 | dict2 merges two dicts. Like { ...dict1, ...dict2 } in TS.
@@ -154,13 +186,27 @@ class MemoryManager:
             "agent_name": agent_name,
             "session_id": session_id,
         } | metadata
+
+        # Include topic tags so future searches can filter by topic.
+        # If no topics provided, extract them from the query context.
+        if topics:
+            storage_metadata["topics"] = topics
+        elif "query_context" in metadata:
+            storage_metadata["topics"] = extract_topics(metadata["query_context"])
         # ^ merges the two dicts. metadata values override if keys conflict.
 
         # Store in Qdrant (long-term — embedded with contextual enrichment)
-        await asyncio.to_thread(self.long_term.store, content, storage_metadata)
+        # and Mem0 (semantic) independently so one backend failure doesn't
+        # prevent returning agent output.
+        try:
+            await asyncio.to_thread(self.long_term.store, content, storage_metadata)
+        except Exception as e:
+            logger.warning("Long-term memory store failed for %s: %s", agent_name, e)
 
-        # Store in Mem0 (semantic — auto-extracts facts)
-        await asyncio.to_thread(self.semantic.store, content, agent_name, storage_metadata)
+        try:
+            await asyncio.to_thread(self.semantic.store, content, agent_name, storage_metadata)
+        except Exception as e:
+            logger.warning("Semantic memory store failed for %s: %s", agent_name, e)
 
         # Update session with latest result
         await self.short_term.store(

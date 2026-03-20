@@ -19,6 +19,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    MatchAny,
     MatchValue,
     PointStruct,
     VectorParams,
@@ -120,7 +121,10 @@ class LongTermMemory:
             context_parts.append(f"Analysis by {metadata['agent_name']} agent")
         if "query_context" in metadata:
             context_parts.append(f"Research query: {metadata['query_context']}")
-        if "topic" in metadata:
+        if "topics" in metadata:
+            # topics is a list like ["gold", "commodities"]
+            context_parts.append(f"Topics: {', '.join(metadata['topics'])}")
+        elif "topic" in metadata:
             context_parts.append(f"Topic: {metadata['topic']}")
 
         if context_parts:
@@ -173,31 +177,87 @@ class LongTermMemory:
         logger.info("Stored in Qdrant: %s (id: %s)", text[:80], point_id)
         return point_id
 
-    def search(self, query: str, limit: int = 5, agent_name: str | None = None) -> list[dict]:
-        """Find semantically similar past research.
+    # Minimum cosine similarity to include a result.
+    # With topic tagging, we can use a LOWER threshold (0.5 instead of 0.7)
+    # because the topic filter already prevents cross-topic contamination.
+    # Within the same topic, 0.5 is safe and catches more related content
+    # (e.g., "gold ETFs" when searching for "gold investing").
+    #
+    # Without topics, we needed 0.7 to block ICICI from gold queries.
+    # With topics, ICICI is tagged "indian_equities" and never even searched.
+    SCORE_THRESHOLD_WITH_TOPICS = 0.5
+    SCORE_THRESHOLD_WITHOUT_TOPICS = 0.7
+
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        agent_name: str | None = None,
+        topics: list[str] | None = None,
+    ) -> list[dict]:
+        """Find semantically similar past research, optionally filtered by topic.
+
+        The two-phase search pattern:
+        1. FILTER — if topics are provided, only search within matching topics
+           (like WHERE topic IN (...) in SQL)
+        2. RANK — order filtered results by cosine similarity
+           (like ORDER BY similarity DESC in SQL)
+
+        This prevents context contamination: ICICI research (tagged "indian_equities")
+        is structurally excluded when searching for gold (tagged "gold", "commodities").
 
         Args:
             query: What to search for (natural language).
             limit: Max results to return.
             agent_name: Optional filter — only return results from this agent.
+            topics: Optional topic tags to filter by. If provided, only results
+                    with at least one matching topic are returned.
 
         Returns:
             List of dicts with text, metadata, and similarity score.
+
+        PYTHON CONCEPT — building filter conditions dynamically:
+        We construct a list of conditions, then pass it to Qdrant's Filter.
+        This is like building a SQL WHERE clause with a query builder:
+            let query = db.select().from("research");
+            if (topics) query = query.where("topic", "in", topics);
+            if (agent) query = query.where("agent_name", "=", agent);
         """
         query_vector = self._embed(query)
 
-        # Build optional filter
-        query_filter = None
-        if agent_name:
-            query_filter = Filter(
-                must=[FieldCondition(key="agent_name", match=MatchValue(value=agent_name))]
+        # Build filter conditions dynamically
+        # PYTHON CONCEPT — building a list of conditions:
+        # Start empty, append as needed. This avoids nested if/else spaghetti.
+        must_conditions = []
+
+        if topics:
+            # MatchAny = Qdrant's "IN" operator.
+            # If the stored "topics" field contains ANY of the query topics, it matches.
+            # Example: stored=["gold","commodities"], query=["gold"] → matches
+            must_conditions.append(
+                FieldCondition(key="topics", match=MatchAny(any=topics))
             )
+
+        if agent_name:
+            must_conditions.append(
+                FieldCondition(key="agent_name", match=MatchValue(value=agent_name))
+            )
+
+        query_filter = Filter(must=must_conditions) if must_conditions else None
+
+        # Use a lower threshold when topic-filtered (contamination is structurally
+        # prevented), higher threshold when searching without topic filtering.
+        threshold = (
+            self.SCORE_THRESHOLD_WITH_TOPICS if topics
+            else self.SCORE_THRESHOLD_WITHOUT_TOPICS
+        )
 
         results = self.client.query_points(
             collection_name=self.COLLECTION_NAME,
             query=query_vector,
             query_filter=query_filter,
             limit=limit,
+            score_threshold=threshold,
         )
 
         # PYTHON CONCEPT — list comprehension with transformation:
@@ -208,6 +268,7 @@ class LongTermMemory:
                 "text": hit.payload.get("text", ""),
                 "agent_name": hit.payload.get("agent_name", "unknown"),
                 "query_context": hit.payload.get("query_context", ""),
+                "topics": hit.payload.get("topics", []),
                 "created_at": hit.payload.get("created_at", ""),
                 "score": hit.score,
                 # ^ PYTHON CONCEPT — dict.get(key, default):

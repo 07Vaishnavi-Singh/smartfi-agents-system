@@ -11,10 +11,11 @@ class Settings(BaseSettings):
     This is enforced by ruff (your linter).
     """
 
-    # --- API Keys (required — app crashes on startup if missing) ---
-    anthropic_api_key: str
-    tavily_api_key: str
-    # langsmith_api_key: str
+    # --- API Keys ---
+    anthropic_api_key: str = ""
+    google_api_key: str = ""
+    tavily_api_key: str = ""
+    langsmith_api_key: str = ""
 
     # --- Infrastructure URLs ---
     redis_url: str = "redis://localhost:6379"
