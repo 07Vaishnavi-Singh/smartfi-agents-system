@@ -97,18 +97,19 @@ DO:
         """
         memory_context = self._format_memory_context(memory_results)
 
-        return f"""Provide a detailed financial analysis for the following:
-
-**Question:** {query}
+        return f"""**DATA BLOCK START** (your analysis must be grounded in this data)
 
 **Available Data (from past research and known facts):**
 {memory_context}
 
-Based on the data above, provide a thorough financial analysis.
+**DATA BLOCK END**
+
+**Question:** {query}
+
+Provide a thorough financial analysis using the data above.
 Focus on valuation metrics, growth trends, and fundamental health.
-If key data is missing, state what you would need to complete the analysis
-and provide your best assessment with what's available.
-Be specific with numbers — avoid vague statements like "strong growth."
+If key data is missing, state what you would need to complete the analysis.
+Your response MUST reference specific numbers from the DATA BLOCK — avoid vague statements like "strong growth."
 """
 
     def extract_sources(self, query: str) -> list[Source]:
