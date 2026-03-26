@@ -95,12 +95,14 @@ Do NOT:
         """
         memory_context = self._format_memory_context(memory_results)
 
-        return f"""Analyze the market sentiment for the following:
-
-**Question:** {query}
+        return f"""**DATA BLOCK START** (ground your sentiment analysis in this data)
 
 **Available Data (from past research and known facts):**
 {memory_context}
+
+**DATA BLOCK END**
+
+**Question:** {query}
 
 Focus on SENTIMENT — how people FEEL about this investment, not the numbers.
 Analyze:
@@ -111,6 +113,7 @@ Analyze:
 - What are analysts saying? What's the consensus view?
 
 Provide a sentiment score from -1.0 (extremely bearish) to +1.0 (extremely bullish).
+Your analysis MUST reference specific data points from the DATA BLOCK above.
 """
 
     def extract_sources(self, query: str) -> list[Source]:

@@ -122,9 +122,7 @@ DO:
                 logger.warning("[researcher] Tavily search failed: %s", e)
                 web_context = "Web search unavailable — analyze based on existing knowledge."
 
-        return f"""Research the following question thoroughly:
-
-**Question:** {query}
+        return f"""**DATA BLOCK START** (read carefully — your analysis must use this data)
 
 **Existing Knowledge (from past research):**
 {memory_context}
@@ -132,10 +130,13 @@ DO:
 **Fresh Web Data:**
 {web_context}
 
-Using ALL the information above (past knowledge + fresh web data), provide a
-comprehensive research synthesis. If the existing knowledge conflicts with
-fresh data, highlight the discrepancy and explain which is more likely current.
-"""
+**DATA BLOCK END**
+
+**Question:** {query}
+
+Using the data above, provide a comprehensive research synthesis.
+If existing knowledge conflicts with fresh data, highlight the discrepancy.
+Your response MUST reference specific data points from the DATA BLOCK above."""
 
     def extract_sources(self, query: str) -> list[Source]:
         """Gather sources from Tavily web search.

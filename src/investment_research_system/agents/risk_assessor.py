@@ -99,14 +99,16 @@ Do NOT:
         """
         memory_context = self._format_memory_context(memory_results)
 
-        return f"""Perform a thorough risk assessment for the following:
-
-**Question:** {query}
+        return f"""**DATA BLOCK START** (use this data to identify specific, grounded risks)
 
 **Available Data (from past research and known facts):**
 {memory_context}
 
-IMPORTANT: Your job is to find what could go WRONG, not what's going right.
+**DATA BLOCK END**
+
+**Question:** {query}
+
+Your job is to find what could go WRONG, not what's going right.
 Think about:
 - Regulatory threats (government action, export controls, antitrust)
 - Competitive threats (who is catching up, market share shifts)
@@ -117,6 +119,7 @@ Think about:
 
 For each risk, estimate severity (low/medium/high) and probability.
 Quantify potential impact in dollar terms or percentage where possible.
+Your risks MUST reference specific data points from the DATA BLOCK above — not generic risks.
 """
 
     def extract_sources(self, query: str) -> list[Source]:
