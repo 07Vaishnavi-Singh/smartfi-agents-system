@@ -111,7 +111,9 @@ def test_orchestrator_passes_config_to_graph():
     mock_agent.name = "researcher"
 
     # Create orchestrator
-    orchestrator = ResearchOrchestrator(agents=[mock_agent], max_retries=0)
+    mock_memory = MagicMock()
+    mock_memory.graph = None
+    orchestrator = ResearchOrchestrator(agents=[mock_agent], memory_manager=mock_memory, max_retries=0)
 
     # Capture the config passed to ainvoke
     captured_config = {}

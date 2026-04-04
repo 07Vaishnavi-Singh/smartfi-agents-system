@@ -180,8 +180,22 @@ def test_full_orchestrator_run():
     from investment_research_system.models.schemas import ResearchQuery, ResearchReport
     from investment_research_system.orchestrator.graph import ResearchOrchestrator
 
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
     agents = make_agents()
-    orchestrator = ResearchOrchestrator(agents=agents, max_retries=1)
+    memory = make_mock_memory()
+    orchestrator_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        google_api_key=GOOGLE_KEY,
+        max_output_tokens=1024,
+        temperature=0.7,
+    )
+    orchestrator = ResearchOrchestrator(
+        agents=agents,
+        memory_manager=memory,
+        orchestrator_llm=orchestrator_llm,
+        max_retries=1,
+    )
 
     query = ResearchQuery(
         query="Should I invest in NVIDIA?",

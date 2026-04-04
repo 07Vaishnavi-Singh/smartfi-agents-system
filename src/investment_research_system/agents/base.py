@@ -78,6 +78,22 @@ Refusal threshold: ONLY refuse genuinely illegal activity. Do NOT refuse:
 - Controversial companies or sectors — analyze objectively
 - Speculative or risky investments — assess the risk, don't refuse
 
+--- USER PROFILE RULE ---
+
+The human message MAY contain a [USER PROFILE] section at the top.
+If present, you MUST tailor your analysis to this user's specific context:
+- **Risk tolerance**: Match recommendation aggressiveness to their stated level.
+  Conservative = emphasize capital preservation; Aggressive = include high-growth options.
+- **Budget**: Frame amounts relative to their monthly investable range.
+  Don't recommend $50k positions to someone with a 10-20k INR/month budget.
+- **Goals & horizon**: Prioritize strategies that align with their goals and time frame.
+  Short horizon = liquidity matters; Long horizon = compounding matters.
+- **Location**: Consider local market context, tax implications, and currency.
+- **Existing investments**: Avoid recommending what they already hold unless adding more
+  is specifically relevant. Suggest diversification gaps.
+If [USER PROFILE] is NOT present, provide generic analysis (no assumptions about the user).
+
+
 --- GROUNDING RULE ---
 
 The human message contains a DATA BLOCK with labeled items ([FACT-1], [RESEARCH-1], etc.).
@@ -236,17 +252,20 @@ class BaseAgent(ABC):
     # CONCRETE METHODS — shared by all agents, no override needed
     # =========================================================================
 
-    async def run(self, query: str, session_id: str) -> AgentResponse:
+    async def run(
+        self, query: str, session_id: str, user_profile_context: str = "",
+    ) -> AgentResponse:
         """Execute this agent's full pipeline.
 
         This is the main method the orchestrator calls. It:
         1. Searches memory for relevant past knowledge
         2. Gathers sources (web search, memory, etc.)
-        3. Builds a prompt with context
-        4. Calls Claude
-        5. Tracks tokens and cost
-        6. Stores results back to memory
-        7. Returns a standardized AgentResponse
+        3. Buils a prompt with contdext
+        4. Prepends user profile from Neo4j (if available)
+        5. Calls Claude
+        6. Tracks tokens and cost
+        7. Stores results back to memory
+        8. Returns a standardized AgentResponse
 
         PYTHON CONCEPT — async def:
         This is async because memory and LLM calls are I/O operations.
@@ -256,6 +275,9 @@ class BaseAgent(ABC):
         Args:
             query: The user's original research question.
             session_id: Current session ID for memory tracking.
+            user_profile_context: Pre-formatted user profile from Neo4j Graph 1.
+                Fetched once in the orchestrator and shared by all agents.
+                Empty string if no user or Neo4j is down (graceful degradation).
 
         Returns:
             AgentResponse with analysis, sources, and cost tracking.
@@ -283,6 +305,14 @@ class BaseAgent(ABC):
 
         # Step 4: Build the prompt with memory context
         user_prompt = self.build_query(query, memory_results)
+
+        # Step 4b: Prepend user profile context (from Neo4j Graph 1).
+        # The profile is injected ABOVE the DATA BLOCK so the agent sees it
+        # first — avoids the "lost in the middle" problem where context buried
+        # deep in the prompt gets ignored by the LLM.
+        # If user_profile_context is empty (no user, Neo4j down), this is a no-op.
+        if user_profile_context:
+            user_prompt = f"{user_profile_context}\n\n{user_prompt}"
 
         # Step 5: Call Claude via LangChain
         # Append structured output instruction to the system prompt so

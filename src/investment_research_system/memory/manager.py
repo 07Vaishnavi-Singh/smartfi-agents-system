@@ -19,6 +19,7 @@ import asyncio
 import logging
 
 from investment_research_system.memory.episodic import EpisodicMemory
+from investment_research_system.memory.graph import GraphMemory
 from investment_research_system.memory.long_term import LongTermMemory
 from investment_research_system.memory.semantic import SemanticMemory
 from investment_research_system.memory.short_term import ShortTermMemory
@@ -46,11 +47,17 @@ class MemoryManager:
         long_term: LongTermMemory,
         semantic: SemanticMemory,
         episodic: EpisodicMemory | None = None,
+        graph: GraphMemory | None = None,
     ):
         self.short_term = short_term
         self.long_term = long_term
         self.semantic = semantic
         self.episodic = episodic
+        # Graph memory (Neo4j) — used by the orchestrator for profile reads.
+        # Profile fetching happens in the orchestrator (once per query), NOT
+        # in parallel_search(). This avoids 4x redundant Neo4j reads since
+        # all agents share the same user context.
+        self.graph = graph
 
     # =========================================================================
     # SESSION MANAGEMENT (Redis)
@@ -259,8 +266,13 @@ class MemoryManager:
         if self.episodic:
             postgres_ok = await asyncio.to_thread(self.episodic.ping)
 
+        neo4j_ok = False
+        if self.graph:
+            neo4j_ok = await asyncio.to_thread(self.graph.ping)
+
         return {
             "redis": redis_ok,
             "qdrant": qdrant_ok,
             "postgres": postgres_ok,
+            "neo4j": neo4j_ok,
         }

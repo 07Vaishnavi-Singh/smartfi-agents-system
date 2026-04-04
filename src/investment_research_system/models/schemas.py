@@ -50,8 +50,9 @@ class Source(BaseModel):
 
 class ResearchQuery(BaseModel):
     """What the user sends in. This is the INPUT to the entire system."""
-    query: str                                                         
-    focus_areas: list[str] = Field(default_factory=list)               
+    query: str
+    user_id: str | None = None  # optional — enables personalized analysis via KG profile
+    focus_areas: list[str] = Field(default_factory=list)
     depth: ResearchDepth = ResearchDepth.standard
     max_budget_usd: float = Field(default=0.50, ge=0.01, le=10.0)     
 
