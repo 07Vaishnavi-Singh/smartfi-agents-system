@@ -29,6 +29,7 @@ from investment_research_system.api.dependencies import get_job_store, get_orche
 from investment_research_system.api.job_store import JobStore
 from investment_research_system.errors import PromptInjectionError
 from investment_research_system.models.schemas import ResearchDepth
+from investment_research_system.models.user import UserProfile, UserProfileUpdate
 from investment_research_system.security.input_guard import sanitize_query
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class ResearchRequest(BaseModel):
     """What the client sends to start a research job."""
 
     query: str = Field(..., min_length=3, max_length=500)
+    user_id: str | None = None  # optional — enables personalized analysis via KG profile
     focus_areas: list[str] = Field(default_factory=list)
     depth: ResearchDepth = ResearchDepth.standard
 
@@ -114,6 +116,7 @@ async def _run_research_job(
 
         query = ResearchQuery(
             query=request.query,
+            user_id=request.user_id,
             focus_areas=request.focus_areas,
             depth=request.depth,
         )
@@ -222,3 +225,110 @@ async def health_check() -> HealthResponse:
         tracing_enabled=is_tracing_enabled(),
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+# =============================================================================
+# USER PROFILE ENDPOINTS (Knowledge Graph — Graph 1)
+# =============================================================================
+# These endpoints manage user profiles stored in Neo4j.
+# The profile data is injected into agent prompts for personalized analysis.
+#
+# Flow: Streamlit form → POST /users/onboard → Neo4j graph
+#       Research query with user_id → orchestrator fetches profile → agents see it
+
+
+@router.post("/users/onboard", status_code=201)
+async def onboard_user(
+    profile: UserProfile,
+    orchestrator_factory=Depends(get_orchestrator_factory),
+) -> dict:
+    """Create a new user profile in Neo4j.
+
+    This is the onboarding endpoint — called once when a user first
+    signs up and fills out the financial profile form.
+
+    Creates nodes (User, Goal, Location, etc.) and edges
+    (HAS_GOAL, LOCATED_IN, etc.) in a single transaction.
+
+    Returns 409 if user_id already exists.
+    """
+    # Late import to avoid circular imports — same pattern as create_orchestrator().
+    # We need the GraphMemory instance from an orchestrator's agent.
+    graph = _get_graph_memory(orchestrator_factory)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Neo4j is not available")
+
+    try:
+        result = await asyncio.to_thread(graph.create_user_profile, profile)
+        return result
+    except ValueError as e:
+        # User already exists — 409 Conflict
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.get("/users/{user_id}/profile")
+async def get_user_profile(
+    user_id: str,
+    orchestrator_factory=Depends(get_orchestrator_factory),
+) -> dict:
+    """Get the current user profile from Neo4j.
+
+    Returns the active profile (only edges where to IS NULL).
+    Historical data is preserved in the graph but not returned here.
+    """
+    graph = _get_graph_memory(orchestrator_factory)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Neo4j is not available")
+
+    profile = await asyncio.to_thread(graph.get_user_profile, user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    return profile
+
+
+@router.put("/users/{user_id}/profile")
+async def update_user_profile(
+    user_id: str,
+    updates: UserProfileUpdate,
+    orchestrator_factory=Depends(get_orchestrator_factory),
+) -> dict:
+    """Update user profile fields using append-only temporal versioning.
+
+    Only send the fields that changed — unchanged fields are left as-is.
+    Old values are preserved with a `to` date (closed edges), new values
+    get `to: null` (active edges).
+
+    TS analogy: This is like PATCH /users/:id — partial update.
+    """
+    graph = _get_graph_memory(orchestrator_factory)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Neo4j is not available")
+
+    try:
+        result = await asyncio.to_thread(graph.update_user_profile, user_id, updates)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+def _get_graph_memory(orchestrator_factory):
+    """Helper to get GraphMemory from an orchestrator instance.
+
+    The orchestrator holds agents, agents hold MemoryManager,
+    MemoryManager holds GraphMemory. This chain is how we access Neo4j
+    without adding a separate dependency injection path for GraphMemory.
+
+    Returns None if Neo4j is not configured or orchestrator creation fails.
+    """
+    try:
+        orchestrator = orchestrator_factory()
+        if orchestrator is None:
+            return None
+        # Grab memory manager from any agent
+        any_agent = next(iter(orchestrator.agents.values()), None)
+        if any_agent and hasattr(any_agent.memory, "graph"):
+            return any_agent.memory.graph
+        return None
+    except Exception:
+        return None

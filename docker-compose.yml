@@ -13,6 +13,17 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
 
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"   # Browser UI — visit http://localhost:7474 to explore graph visually
+      - "7687:7687"   # Bolt protocol — Python driver connects here
+    environment:
+      NEO4J_AUTH: neo4j/agent_pass  # format: username/password
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
   # postgres:
   #   image: postgres:16-alpine
   #   ports:
@@ -27,4 +38,5 @@ services:
 
 volumes:
   qdrant_data:
+  neo4j_data:
   postgres_data:
