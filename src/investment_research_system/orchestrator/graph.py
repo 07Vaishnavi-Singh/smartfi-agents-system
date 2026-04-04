@@ -1,84 +1,95 @@
-"""LangGraph orchestrator — the brain that runs all agents.
+"""LangGraph orchestrator agent — LLM-powered ReAct loop.
 
-This uses a HYBRID approach:
-  Phase 1 (parallel): Gatherers  — researcher + sentiment (fetch fresh data)
-  Phase 2 (parallel): Analyzers  — analyst + risk (analyze the fresh data)
+ALTERNATIVE IMPLEMENTATION — LangGraph's built-in ReAct agent:
 
-Why hybrid?
-- Phase 1 agents GATHER information (web search, news)
-- They store results in memory via MemoryManager.store_research()
-- Phase 2 agents then pull that fresh data from memory
-- Analyst gets the researcher's fresh findings, not just stale memory
+    from langgraph.prebuilt import create_react_agent
 
-Both phases are parallel WITHIN themselves. Only the boundary
-between phases is sequential.
+    orchestrator = create_react_agent(
+        model=llm.bind_tools([dispatch_agents, search_memory, build_report]),
+        tools=[dispatch_agents, search_memory, build_report],
+        prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+    )
+    result = await orchestrator.ainvoke({"messages": [("user", query)]})
 
-    ┌──────────────────────────────────┐
-    │  Phase 1: GATHER (parallel)      │
-    │  ┌────────────┐ ┌────────────┐  │
-    │  │ Researcher │ │ Sentiment  │  │
-    │  └────────────┘ └────────────┘  │
-    └──────────────┬───────────────────┘
-                   │ results stored in memory
-                   ▼
-    ┌──────────────────────────────────┐
-    │  Phase 2: ANALYZE (parallel)     │
-    │  ┌────────────┐ ┌────────────┐  │
-    │  │  Analyst   │ │    Risk    │  │
-    │  └────────────┘ └────────────┘  │
-    └──────────────┬───────────────────┘
-                   ▼
-         Conflicts → Quality → Report
+We built the custom loop because:
+1. Python-level guardrails (max iterations, budget tracking)
+2. Custom state accumulation (agent_responses across turns)
+3. Forced report fallback when iterations exhausted
+4. Full visibility for debugging and observability
 
-PYTHON CONCEPT — TypedDict:
-LangGraph uses TypedDict to define the "state" — a dict with fixed keys
-and known types. Each node receives the state, adds to it, returns it.
+ARCHITECTURE:
+The orchestrator LLM reasons over a growing message history and calls
+tools (dispatch_agents, search_memory, build_report) via bind_tools().
+A conditional edge decides whether to loop or exit.
 
-TS equivalent: interface State { query: string; responses: AgentResponse[]; ... }
-Rust equivalent: struct State { query: String, responses: Vec<AgentResponse>, ... }
+    START → fetch_user_profile → orchestrator_llm ⟲ execute_tools
+                                        ↓ (done)
+                                  build_final_report → END
 
-LANGGRAPH CONCEPT — StateGraph:
-A StateGraph is a directed graph where:
-- Nodes = functions that transform state
-- Edges = connections between nodes (which runs after which)
-- State = the data that flows through the graph
-You define the graph, compile it, then invoke it with input.
+PYTHON CONCEPT — Annotated reducers:
+LangGraph uses Annotated[list[X], operator.add] to define how state
+fields accumulate across nodes. When a node returns {"agent_responses": [new_item]},
+LangGraph concatenates it with the existing list rather than replacing it.
+TS equivalent: a Redux reducer that merges arrays.
 """
 
 import asyncio
 import logging
+import operator
 import time
+from typing import Annotated
 from uuid import uuid4
 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from investment_research_system.agents.base import LLM_CALL_TIMEOUT_SECONDS, BaseAgent
-from investment_research_system.errors import (
-    AgentError,
-    BudgetExceededError,
-    LLMRateLimitError,
-    LLMRefusalError,
-    LLMTimeoutError,
-    MemoryUnavailableError,
-)
+from investment_research_system.agents.base import BaseAgent
 from investment_research_system.models.schemas import AgentResponse, ResearchQuery, ResearchReport
 from investment_research_system.observability.tracing import get_run_config
-from investment_research_system.orchestrator.conflict import detect_conflicts, format_conflicts_summary
-from investment_research_system.orchestrator.quality import QualityAssessment, assess_quality, format_quality_summary
+from investment_research_system.orchestrator.tools import (
+    create_build_report_tool,
+    create_dispatch_agents_tool,
+    create_search_memory_tool,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Agents are split into two phases based on their role
-# Gatherers fetch new data, analyzers interpret it
-GATHERER_AGENTS = {"researcher", "sentiment"}
-ANALYZER_AGENTS = {"analyst", "risk_assessor"}
+MAX_ITERATIONS_DEFAULT = 5
+
+ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator agent in a multi-agent investment research system.
+You coordinate 4 specialist agents to answer investment research queries.
+
+AVAILABLE AGENTS:
+- researcher: Gathers raw facts, data points, financial metrics from the web
+- sentiment: Analyzes market mood, analyst ratings, insider activity, news sentiment
+- analyst: Interprets financial data, valuation, peer comparison (works best AFTER researcher)
+- risk_assessor: Identifies risks, threats, downside scenarios (works best AFTER researcher)
+
+STRATEGY:
+1. FIRST call search_memory to check if past research already covers this query
+2. If memory has sufficient recent data, you may skip some agents
+3. If memory is stale or empty, dispatch gatherers first (researcher, sentiment)
+4. After gatherers return, dispatch analyzers (analyst, risk_assessor) — they benefit from fresh data the gatherers stored in memory
+5. After all agents return, evaluate: do you have enough to answer the question?
+6. Call build_report when you have sufficient data
+
+RULES:
+- You can dispatch multiple agents in a single call (they run in parallel)
+- Prefer dispatching gatherers before analyzers — analyzers use gatherer data
+- If an agent fails, decide whether to retry it or proceed without it
+- Do NOT dispatch the same agent twice unless the first attempt failed
+- You have a limited number of turns — be efficient, don't over-research
+- When in doubt, build the report with what you have rather than looping"""
 
 
 # =============================================================================
-# CIRCUIT BREAKER
+# CIRCUIT BREAKER (unchanged from previous implementation)
 # =============================================================================
+
 
 class CircuitBreaker:
     """Circuit breaker pattern — prevents calling agents that keep failing.
@@ -89,8 +100,8 @@ class CircuitBreaker:
     - Testing (HALF_OPEN): timeout passed, try ONE call to test
 
     PYTHON CONCEPT — time.time():
-    Returns seconds since epoch (Jan 1, 1970) as a float.
-    Used for tracking when failures happened and when to reset.
+    Returns seconds since epoch as a float. Used for tracking when
+    failures happened and when to reset.
     TS equivalent: Date.now() / 1000
     Rust equivalent: std::time::Instant::now()
     """
@@ -98,46 +109,34 @@ class CircuitBreaker:
     def __init__(self, max_failures: int = 3, reset_timeout: int = 60):
         self.max_failures = max_failures
         self.reset_timeout = reset_timeout
-        # Track state per agent
-        self._failures: dict[str, int] = {}          # agent_name → failure count
-        self._last_failure: dict[str, float] = {}    # agent_name → timestamp
-        self._state: dict[str, str] = {}             # agent_name → "closed"/"open"/"half_open"
+        self._failures: dict[str, int] = {}
+        self._last_failure: dict[str, float] = {}
+        self._state: dict[str, str] = {}
 
     def can_call(self, agent_name: str) -> bool:
-        """Check if an agent is safe to call.
-
-        Returns True if the circuit is closed (healthy) or half-open (testing).
-        Returns False if the circuit is open (agent is failing too much).
-        """
+        """Check if an agent is safe to call."""
         state = self._state.get(agent_name, "closed")
-
         if state == "closed":
             return True
-
         if state == "open":
-            # Check if enough time has passed to try again
             last_fail = self._last_failure.get(agent_name, 0)
             if time.time() - last_fail > self.reset_timeout:
                 self._state[agent_name] = "half_open"
                 logger.info("[circuit_breaker] %s → HALF_OPEN (testing)", agent_name)
-                return True  # allow one test call
-            return False  # still too soon
-
-        # half_open — allow the test call
-        return True
+                return True
+            return False
+        return True  # half_open — allow test call
 
     def record_success(self, agent_name: str) -> None:
         """Agent call succeeded — reset the breaker."""
         self._failures[agent_name] = 0
         self._state[agent_name] = "closed"
-        if agent_name in self._last_failure:
-            del self._last_failure[agent_name]
+        self._last_failure.pop(agent_name, None)
 
     def record_failure(self, agent_name: str) -> None:
-        """Agent call failed — increment failure count, maybe trip the breaker."""
+        """Agent call failed — increment count, maybe trip."""
         self._failures[agent_name] = self._failures.get(agent_name, 0) + 1
         self._last_failure[agent_name] = time.time()
-
         if self._failures[agent_name] >= self.max_failures:
             self._state[agent_name] = "open"
             logger.warning(
@@ -151,516 +150,363 @@ class CircuitBreaker:
 
 
 # =============================================================================
-# LANGGRAPH STATE
+# STATE
 # =============================================================================
 
-class OrchestratorState(TypedDict):
-    """The shared state that flows between nodes in the graph.
 
-    LANGGRAPH CONCEPT — State:
-    Every node receives this dict, can read any field, and returns
-    updates to it. LangGraph merges the updates into the state
-    automatically.
+class OrchestratorAgentState(TypedDict):
+    """State for the orchestrator agent ReAct loop.
 
-    Think of it as a shared document that each workstation fills in.
+    LANGGRAPH CONCEPT — Annotated reducers:
+    messages uses add_messages (auto-appends new messages).
+    agent_responses and failed_agents use operator.add (list concat).
+    remaining_iterations and total_cost_usd are plain fields (replaced atomically).
     """
 
-    query: str                                    # user's original question
-    research_query: ResearchQuery                 # parsed query with settings
-    session_id: str                               # unique session ID
-    agent_responses: list[AgentResponse]          # collected responses
-    failed_agents: list[dict]                      # agents that couldn't respond (with error details)
-    conflicts: list[dict]                         # disagreements between agents
-    quality: QualityAssessment | None             # quality grade
-    report: ResearchReport | None                 # final output
-    start_time: float                             # for tracking total latency
+    messages: Annotated[list[BaseMessage], add_messages]
+    research_query: ResearchQuery
+    session_id: str
+    user_profile_context: str
+    agent_responses: Annotated[list[AgentResponse], operator.add]
+    failed_agents: Annotated[list[dict], operator.add]
+    remaining_iterations: int
+    total_cost_usd: float
+    report: ResearchReport | None
+    start_time: float
 
 
 # =============================================================================
-# ORCHESTRATOR CLASS
+# ORCHESTRATOR
 # =============================================================================
+
 
 class ResearchOrchestrator:
-    """LangGraph-powered research orchestrator using hybrid parallel strategy.
+    """LLM-powered orchestrator agent using a custom ReAct loop.
 
-    HYBRID APPROACH:
-    Phase 1 (parallel): Gatherers (researcher + sentiment) fetch fresh data
-    Phase 2 (parallel): Analyzers (analyst + risk) interpret that data
-
-    Both phases run their agents in parallel. The phases themselves
-    are sequential so analyzers can use the gatherers' fresh results.
+    The orchestrator LLM decides at runtime which agents to call,
+    evaluates results, and decides when to build the final report.
+    Tools are bound via LangChain's bind_tools().
 
     The flow:
-    START → run_gatherers → run_analyzers → detect_conflicts
-          → quality_check → build_report → END
+    START → fetch_user_profile → orchestrator_llm ⟲ execute_tools
+                                        ↓ (done)
+                                  build_final_report → END
     """
 
     def __init__(
         self,
         agents: list[BaseAgent],
+        memory_manager,
         circuit_breaker: CircuitBreaker | None = None,
+        orchestrator_llm=None,
         max_retries: int = 1,
         retry_delay: float = 1.0,
+        max_iterations: int = MAX_ITERATIONS_DEFAULT,
     ):
         self.agents = {agent.name: agent for agent in agents}
-        # PYTHON CONCEPT — dict comprehension:
-        # Creates {"researcher": ResearcherAgent, "analyst": AnalystAgent, ...}
-        # from a list of agents. Lookup by name is O(1).
-        # TS equivalent: Object.fromEntries(agents.map(a => [a.name, a]))
-
-        # Split agents into gatherers and analyzers
-        self.gatherers = {
-            name: agent for name, agent in self.agents.items()
-            if name in GATHERER_AGENTS
-        }
-        self.analyzers = {
-            name: agent for name, agent in self.agents.items()
-            if name in ANALYZER_AGENTS
-        }
-
-        # Any agent not in either group goes into analyzers (safe default)
-        for name, agent in self.agents.items():
-            if name not in GATHERER_AGENTS and name not in ANALYZER_AGENTS:
-                self.analyzers[name] = agent
-
+        self.memory_manager = memory_manager
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.max_iterations = max_iterations
+
+        # Create tool functions via factories (closure pattern)
+        self._dispatch_fn = create_dispatch_agents_tool(
+            agents=self.agents,
+            circuit_breaker=self.circuit_breaker,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
+        )
+        self._search_fn = create_search_memory_tool(memory_manager=self.memory_manager)
+        self._report_fn = create_build_report_tool(
+            orchestrator_llm=orchestrator_llm,
+            memory_manager=self.memory_manager,
+        )
+
+        # Build LangChain @tool wrappers for bind_tools schema generation
+        self._tools = self._make_langchain_tools()
+
+        # Bind tools to the orchestrator LLM
+        if orchestrator_llm is not None:
+            try:
+                self.orchestrator_llm = orchestrator_llm.bind_tools(self._tools)
+                logger.info("[orchestrator] Tools bound to LLM successfully")
+            except Exception as e:
+                logger.warning("[orchestrator] bind_tools() failed: %s. Using unbound LLM.", e)
+                self.orchestrator_llm = orchestrator_llm
+        else:
+            self.orchestrator_llm = None
+
+        # Mutable context shared with tools during execution
+        self._tool_context: dict = {}
+
         self.graph = self._build_graph()
 
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph state machine with hybrid phases.
+    def _make_langchain_tools(self):
+        """Create LangChain @tool wrappers for schema generation.
 
-        The flow:
-        START → run_gatherers → run_analyzers → detect_conflicts
-              → quality_check → build_report → END
+        These are thin wrappers that generate the JSON Schema for bind_tools().
+        Actual execution goes through the factory-created functions with _tool_context.
 
-        Phase 1 and 2 are separate nodes. Within each node,
-        agents run in parallel via asyncio.gather().
+        PYTHON CONCEPT — nested closures:
+        Each @tool function captures `self` from the enclosing method.
+        When LangGraph calls tool.ainvoke(), the wrapper runs,
+        reads self._tool_context, and delegates to the factory function.
         """
-        graph = StateGraph(OrchestratorState)
 
-        # Add nodes
-        graph.add_node("run_gatherers", self._node_run_gatherers)
-        graph.add_node("run_analyzers", self._node_run_analyzers)
-        graph.add_node("detect_conflicts", self._node_detect_conflicts)
-        graph.add_node("quality_check", self._node_quality_check)
-        graph.add_node("build_report", self._node_build_report)
+        @tool
+        async def dispatch_agents(agent_names: list[str]) -> str:
+            """Run one or more research agents in parallel.
+            Available agents: researcher, sentiment, analyst, risk_assessor.
+            Returns each agent's analysis with confidence scores."""
+            return await self._dispatch_fn(agent_names, _context=self._tool_context)
 
-        # Add edges — the hybrid flow
-        graph.add_edge(START, "run_gatherers")
-        graph.add_edge("run_gatherers", "run_analyzers")
-        # ^ This is the key sequential boundary.
-        #   Gatherers MUST finish before analyzers start.
-        #   Gatherers store results in memory → analyzers read from memory.
-        graph.add_edge("run_analyzers", "detect_conflicts")
-        graph.add_edge("detect_conflicts", "quality_check")
-        graph.add_edge("quality_check", "build_report")
-        graph.add_edge("build_report", END)
+        @tool
+        async def search_memory(query: str) -> str:
+            """Search past research in long-term memory. Use this before
+            dispatching agents to check if relevant research already exists."""
+            return await self._search_fn(query)
+
+        @tool
+        async def build_report(reasoning: str) -> str:
+            """Synthesize all collected agent responses into the final research report.
+            Call this when you have sufficient data to answer the user's question.
+            The reasoning parameter should explain your assessment of data quality."""
+            return await self._report_fn(reasoning, _context=self._tool_context)
+
+        return [dispatch_agents, search_memory, build_report]
+
+    def _build_graph(self) -> StateGraph:
+        """Build the ReAct loop StateGraph.
+
+        LANGGRAPH CONCEPT — conditional edges:
+        add_conditional_edges() takes a function that returns a string
+        matching one of the edge targets. This is how the loop works:
+        orchestrator_llm → should_continue() → "execute_tools" or "build_final_report"
+        """
+        graph = StateGraph(OrchestratorAgentState)
+
+        graph.add_node("fetch_user_profile", self._node_fetch_user_profile)
+        graph.add_node("orchestrator_llm", self._node_orchestrator_llm)
+        graph.add_node("execute_tools", self._node_execute_tools)
+        graph.add_node("build_final_report", self._node_build_final_report)
+
+        graph.add_edge(START, "fetch_user_profile")
+        graph.add_edge("fetch_user_profile", "orchestrator_llm")
+        graph.add_conditional_edges("orchestrator_llm", self._should_continue, {
+            "execute_tools": "execute_tools",
+            "build_final_report": "build_final_report",
+        })
+        graph.add_edge("execute_tools", "orchestrator_llm")
+        graph.add_edge("build_final_report", END)
 
         return graph.compile()
 
     # =========================================================================
-    # SHARED HELPER
+    # CONDITIONAL EDGE
     # =========================================================================
 
-    async def _run_agent_with_retry(
-        self, agent: BaseAgent, query: str, session_id: str,
-    ) -> tuple[AgentResponse | None, dict | None]:
-        """Run a single agent with retry + circuit breaker + typed error handling.
+    def _should_continue(self, state: OrchestratorAgentState) -> str:
+        """Decide whether to continue the loop or build the report.
 
-        Uses the error hierarchy to make intelligent recovery decisions:
-        - Timeout/rate limit → retry with backoff
-        - Refusal/budget exceeded → don't retry (won't help)
-        - Memory unavailable → retry (transient infra issue)
-        - Unknown error → retry (might be transient)
-
-        Returns a tuple of (response, failure_info).
-        On success: (AgentResponse, None)
-        On failure: (None, {"agent": str, "error_type": str, "error_message": str})
+        Routes to:
+        - "build_final_report" if report already built, no tool calls, or iterations exhausted
+        - "execute_tools" if LLM wants to call tools and iterations remain
         """
-        if not self.circuit_breaker.can_call(agent.name):
-            logger.warning("[orchestrator] Skipping %s — circuit breaker OPEN", agent.name)
-            return None, {
-                "agent": agent.name,
-                "error_type": "circuit_breaker",
-                "error_message": "Skipped — too many recent failures (circuit breaker open)",
-            }
+        if state["report"] is not None:
+            return "build_final_report"
 
-        # Track the last error so we can report it if all retries fail
-        last_error_type = "unknown"
-        last_error_message = "Unknown error"
+        messages = state["messages"]
+        if not messages:
+            return "build_final_report"
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = await agent.run(query, session_id)
-                self.circuit_breaker.record_success(agent.name)
-                return response, None
+        last_message = messages[-1]
 
-            except BudgetExceededError:
-                # Hard stop — retrying or switching providers won't help
-                logger.info("[orchestrator] %s hit budget limit, stopping", agent.name)
-                return None, {
-                    "agent": agent.name,
-                    "error_type": "budget_exceeded",
-                    "error_message": "Stopped — query exceeded its allocated cost budget",
-                }
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls and state["remaining_iterations"] > 0:
+            return "execute_tools"
 
-            except LLMRefusalError as e:
-                # Model won't answer this — retrying is pointless
-                logger.warning("[orchestrator] %s refused query: %s", agent.name, e)
-                return None, {
-                    "agent": agent.name,
-                    "error_type": "refused",
-                    "error_message": "Model refused to answer this query",
-                }
-
-            except LLMRateLimitError as e:
-                # Backoff harder on rate limits (exponential)
-                last_error_type = "rate_limit"
-                last_error_message = "Rate limited by LLM provider"
-                logger.warning(
-                    "[orchestrator] %s rate limited (attempt %d/%d): %s",
-                    agent.name, attempt + 1, self.max_retries + 1, e,
-                )
-                if attempt < self.max_retries:
-                    backoff = self.retry_delay * (2 ** attempt)
-                    await asyncio.sleep(backoff)
-
-            except LLMTimeoutError as e:
-                # Transient — retry with linear backoff
-                last_error_type = "timeout"
-                last_error_message = f"Timed out after {LLM_CALL_TIMEOUT_SECONDS}s (retried {self.max_retries + 1} times)"
-                logger.warning(
-                    "[orchestrator] %s timed out (attempt %d/%d): %s",
-                    agent.name, attempt + 1, self.max_retries + 1, e,
-                )
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-
-            except MemoryUnavailableError as e:
-                # Infra issue — retry, might recover
-                last_error_type = "memory_unavailable"
-                last_error_message = "Memory backend (Redis/Qdrant) unreachable"
-                logger.warning(
-                    "[orchestrator] %s memory unavailable (attempt %d/%d): %s",
-                    agent.name, attempt + 1, self.max_retries + 1, e,
-                )
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-
-            except AgentError as e:
-                # Catch-all for other typed agent errors
-                last_error_type = "agent_error"
-                last_error_message = str(e)
-                logger.warning(
-                    "[orchestrator] %s failed (attempt %d/%d): %s",
-                    agent.name, attempt + 1, self.max_retries + 1, e,
-                )
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-
-            except Exception as e:
-                # Truly unexpected — log at error level, still retry
-                last_error_type = "unexpected"
-                last_error_message = f"Unexpected error: {type(e).__name__}"
-                logger.error(
-                    "[orchestrator] %s unexpected error (attempt %d/%d): %s",
-                    agent.name, attempt + 1, self.max_retries + 1, e,
-                    exc_info=True,
-                )
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-
-        # All retries exhausted
-        self.circuit_breaker.record_failure(agent.name)
-        return None, {
-            "agent": agent.name,
-            "error_type": last_error_type,
-            "error_message": last_error_message,
-        }
-
-    async def _run_agents_parallel(
-        self, agents: dict[str, BaseAgent], query: str, session_id: str,
-    ) -> tuple[list[AgentResponse], list[dict]]:
-        """Run a group of agents in parallel, return responses + failure details.
-
-        PYTHON CONCEPT — tuple return:
-        Returns two values as a tuple: (responses, failed_agents).
-        failed_agents is a list of dicts with keys: agent, error_type, error_message.
-        TS equivalent: return [responses, failedAgents] with destructuring.
-        Rust equivalent: (Vec<AgentResponse>, Vec<FailureInfo>)
-        """
-        results = await asyncio.gather(
-            *[self._run_agent_with_retry(agent, query, session_id) for agent in agents.values()],
-        )
-
-        responses = []
-        failed = []
-
-        for response, failure_info in results:
-            if response is not None:
-                responses.append(response)
-            elif failure_info is not None:
-                failed.append(failure_info)
-
-        return responses, failed
+        return "build_final_report"
 
     # =========================================================================
     # NODE FUNCTIONS
     # =========================================================================
 
-    async def _node_run_gatherers(self, state: OrchestratorState) -> dict:
-        """Node 1: Run GATHERER agents in parallel (researcher + sentiment).
+    async def _node_fetch_user_profile(self, state: OrchestratorAgentState) -> dict:
+        """Fetch user profile from Neo4j once before the loop starts.
 
-        These agents fetch fresh data from the web and news.
-        Their results are stored in memory (via base agent's run() method),
-        so Phase 2 analyzers can access them.
+        WHY A SEPARATE NODE:
+        If 4 agents each fetch the profile, that's 4x redundant Neo4j reads.
+        By fetching once and storing in state, all agents share the same context.
 
-        HYBRID APPROACH — why gatherers first:
-        The researcher searches Tavily and stores findings in Qdrant/Mem0.
-        When the analyst runs in Phase 2, its memory.parallel_search()
-        will find the researcher's fresh data alongside historical data.
-        This gives the analyst CURRENT information to analyze.
+        GRACEFUL DEGRADATION:
+        If Neo4j is down or no user_id → returns empty string.
+        Agents run normally, just without [USER PROFILE] section.
         """
-        query = state["query"]
-        session_id = state["session_id"]
+        user_id = state["research_query"].user_id
+        if not user_id:
+            return {"user_profile_context": ""}
 
-        logger.info(
-            "[orchestrator] Phase 1: Running %d gatherers in parallel",
-            len(self.gatherers),
-        )
-
-        responses, failed = await self._run_agents_parallel(
-            self.gatherers, query, session_id,
-        )
-
-        logger.info(
-            "[orchestrator] Phase 1 complete: %d succeeded, %d failed",
-            len(responses), len(failed),
-        )
-
-        return {
-            "agent_responses": responses,
-            "failed_agents": failed,
-        }
-
-    async def _node_run_analyzers(self, state: OrchestratorState) -> dict:
-        """Node 2: Run ANALYZER agents in parallel (analyst + risk).
-
-        These agents analyze data — including fresh data that
-        the gatherers just stored in memory.
-
-        Even if all gatherers failed, analyzers still run.
-        They'll use whatever is in memory (possibly stale data).
-        The quality checker will note the degraded quality.
-        """
-        query = state["query"]
-        session_id = state["session_id"]
-
-        logger.info(
-            "[orchestrator] Phase 2: Running %d analyzers in parallel",
-            len(self.analyzers),
-        )
-
-        responses, failed = await self._run_agents_parallel(
-            self.analyzers, query, session_id,
-        )
-
-        logger.info(
-            "[orchestrator] Phase 2 complete: %d succeeded, %d failed",
-            len(responses), len(failed),
-        )
-
-        # Merge with Phase 1 results (not replace)
-        # PYTHON CONCEPT — list concatenation with +:
-        # [1, 2] + [3, 4] = [1, 2, 3, 4]
-        # TS equivalent: [...phase1, ...phase2]
-        return {
-            "agent_responses": state["agent_responses"] + responses,
-            "failed_agents": state["failed_agents"] + failed,
-        }
-
-    async def _node_detect_conflicts(self, state: OrchestratorState) -> dict:
-        """Node 3: Find disagreements between agent responses."""
-        conflicts = detect_conflicts(state["agent_responses"])
-        return {"conflicts": conflicts}
-
-    async def _node_quality_check(self, state: OrchestratorState) -> dict:
-        """Node 4: Assess the quality of the collected responses."""
-        quality = assess_quality(
-            responses=state["agent_responses"],
-            conflicts=state["conflicts"],
-            failed_agents=state["failed_agents"],
-        )
-        return {"quality": quality}
-
-    async def _node_build_report(self, state: OrchestratorState) -> dict:
-        """Node 5: Synthesize all agent outputs into a coherent summary via LLM.
-
-        Instead of dumb truncation, we pass all agent outputs to the LLM
-        and ask it to produce a unified investment research summary with
-        citations. This is one extra LLM call — much cheaper than a full
-        agent pipeline (no memory search, no web search, no source gathering).
-        """
-        elapsed = time.time() - state["start_time"]
-
-        # Build context from all agent responses for the synthesis prompt
-        agent_outputs = []
-        for response in state["agent_responses"]:
-            agent_outputs.append(
-                f"=== {response.agent_name.upper()} ===\n"
-                f"Confidence: {response.confidence:.2f}\n"
-                f"{response.content}"
-            )
-
-        conflicts_text = format_conflicts_summary(state["conflicts"])
-        quality_text = format_quality_summary(state["quality"])
-
-        # Calculate totals before the synthesis call
-        total_tokens = sum(r.tokens_used for r in state["agent_responses"])
-        total_cost = sum(r.cost_usd for r in state["agent_responses"])
-
-        # Try LLM-powered synthesis, fall back to basic concatenation if it fails
-        summary = await self._synthesize_summary(
-            query=state["query"],
-            agent_outputs=agent_outputs,
-            conflicts_text=conflicts_text,
-            quality_text=quality_text,
-        )
-
-        # Add synthesis tokens/cost to totals
-        total_tokens += self._last_synthesis_tokens
-        total_cost += self._last_synthesis_cost
-
-        report = ResearchReport(
-            id=str(uuid4()),
-            query=state["research_query"],
-            summary=summary,
-            agent_responses=state["agent_responses"],
-            failed_agents=state["failed_agents"],
-            total_cost_usd=total_cost,
-            total_tokens=total_tokens,
-            processing_time_seconds=round(elapsed, 2),
-        )
-
-        logger.info(
-            "[orchestrator] Report built: %d agents, %d tokens, $%.4f, %.1fs",
-            len(state["agent_responses"]), total_tokens, total_cost, elapsed,
-        )
-
-        return {"report": report}
-
-    async def _synthesize_summary(
-        self,
-        query: str,
-        agent_outputs: list[str],
-        conflicts_text: str,
-        quality_text: str,
-    ) -> str:
-        """Use the LLM to synthesize agent outputs into a coherent summary.
-
-        Grabs the LLM from the first available agent (they all share the same
-        LLM instance). Falls back to basic concatenation if the LLM call fails.
-        """
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        self._last_synthesis_tokens = 0
-        self._last_synthesis_cost = 0
-
-        # Grab LLM from any agent — they all share the same instance
-        any_agent = next(iter(self.agents.values()), None)
-        if not any_agent:
-            return self._fallback_summary(agent_outputs, conflicts_text, quality_text)
-
-        system_prompt = """You are the SYNTHESIS editor in a multi-agent investment research pipeline.
-
-You receive reports from 4 specialized agents:
-- RESEARCHER: raw facts, data points, sources (evidence layer)
-- ANALYST: financial interpretation, valuation, metrics (numbers layer)
-- SENTIMENT: market mood, narrative, insider activity (psychology layer)
-- RISK ASSESSOR: risks, threats, devil's advocate view (adversarial layer)
-
-Your job: Merge these into ONE coherent research summary that a decision-maker can act on.
-
-Synthesis rules:
-- NEVER add information that wasn't in the agent reports — you are an editor, not an analyst
-- When agents AGREE: state the consensus concisely, cite both
-- When agents DISAGREE: present the tension explicitly — "The analyst sees fair valuation at P/E 28, but the risk assessor flags that this assumes 20% growth continuation, which faces [specific threat]"
-- Weight reliability: Researcher's confirmed facts > Analyst's metrics > Sentiment signals
-- Preserve uncertainty: if an agent flagged low confidence or data gaps, carry that through
-
-Structure (aim for 400-600 words):
-1. **Executive Summary** — 2-3 sentences: what is this, what's the verdict, what's the confidence level
-2. **Key Findings** — top 3-5 facts from the Researcher, with confirmation tags
-3. **Financial Analysis** — Analyst's valuation assessment and key metrics
-4. **Market Sentiment** — Sentiment score, narrative, any divergence from fundamentals
-5. **Risk Assessment** — Top 2-3 risks from the Risk Assessor with severity ratings
-6. **Conclusion** — balanced synthesis: where do the agents agree/disagree? What's the overall picture?
-
-Tone: Professional, balanced, specific. Write for someone who has 2 minutes to read this.
-Do NOT give buy/sell recommendations — present the evidence and let the reader decide."""
-
-        human_prompt = f"""Original question: {query}
-
-Here are the reports from our specialized agents:
-
-{"".join(f"{output}" + chr(10) + chr(10) for output in agent_outputs)}
-{conflicts_text}
-
-{quality_text}
-
-Synthesize these into a single coherent research summary."""
+        if not self.memory_manager or not hasattr(self.memory_manager, "graph") or not self.memory_manager.graph:
+            return {"user_profile_context": ""}
 
         try:
-            # Use the primary LLM (with fallback chain if available)
-            response = await any_agent._call_llm_with_fallback([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=human_prompt),
-            ])
-
-            # Track synthesis cost
-            usage = response.usage_metadata or {}
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-            self._last_synthesis_tokens = input_tokens + output_tokens
-            # Use approximate Gemini pricing (much cheaper than Claude)
-            self._last_synthesis_cost = (input_tokens + output_tokens) * 0.5 / 1_000_000
-
-            logger.info(
-                "[orchestrator] Synthesis complete: %d tokens",
-                self._last_synthesis_tokens,
+            profile = await asyncio.to_thread(
+                self.memory_manager.graph.format_profile_for_agents, user_id
             )
-            return response.content
-
+            if profile:
+                logger.info("[orchestrator] User profile loaded for %s", user_id)
+            return {"user_profile_context": profile or ""}
         except Exception as e:
-            logger.warning(
-                "[orchestrator] LLM synthesis failed, using fallback: %s", e,
-            )
-            return self._fallback_summary(agent_outputs, conflicts_text, quality_text)
+            logger.warning("[orchestrator] Neo4j profile fetch failed: %s", e)
+            return {"user_profile_context": ""}
 
-    def _fallback_summary(
-        self, agent_outputs: list[str], conflicts_text: str, quality_text: str,
-    ) -> str:
-        """Basic concatenation fallback if LLM synthesis fails."""
-        summary = "\n\n".join(agent_outputs)
-        summary += f"\n\n---\n{conflicts_text}\n\n{quality_text}"
-        return summary
+    async def _node_orchestrator_llm(self, state: OrchestratorAgentState) -> dict:
+        """Call the orchestrator LLM with the current message history.
+
+        The LLM sees all previous messages (system prompt, user query,
+        past tool calls and results) and decides what to do next:
+        - Call a tool (dispatch_agents, search_memory, build_report)
+        - Return plain text (loop exits)
+        """
+        if self.orchestrator_llm is None:
+            logger.error("[orchestrator] No LLM configured")
+            return {}
+
+        response = await self.orchestrator_llm.ainvoke(state["messages"])
+
+        # Track orchestrator LLM cost
+        usage = getattr(response, "usage_metadata", None) or {}
+        input_tokens = usage.get("input_tokens", 0) if isinstance(usage, dict) else 0
+        output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
+        orch_cost = (input_tokens + output_tokens) * 0.5 / 1_000_000
+
+        return {
+            "messages": [response],
+            "total_cost_usd": state["total_cost_usd"] + orch_cost,
+        }
+
+    async def _node_execute_tools(self, state: OrchestratorAgentState) -> dict:
+        """Execute tool calls from the LLM response.
+
+        Runs each tool call sequentially (even if the LLM returned multiple
+        in one turn) to avoid race conditions on shared _tool_context.
+        Decrements remaining_iterations once per node invocation.
+        """
+        messages = state["messages"]
+        last_message = messages[-1]
+
+        if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+            return {"remaining_iterations": state["remaining_iterations"] - 1}
+
+        # Budget enforcement — skip tool execution if budget exhausted
+        max_budget = state["research_query"].max_budget_usd
+        if state["total_cost_usd"] >= max_budget:
+            logger.warning(
+                "[orchestrator] Budget exhausted ($%.4f >= $%.2f), forcing report",
+                state["total_cost_usd"], max_budget,
+            )
+            tool_id = last_message.tool_calls[0]["id"]
+            return {
+                "messages": [ToolMessage(
+                    content="BUDGET EXHAUSTED. Call build_report immediately with whatever data you have.",
+                    tool_call_id=tool_id,
+                )],
+                "remaining_iterations": 0,
+            }
+
+        # Set up tool context for this iteration
+        self._tool_context = {
+            "query": state["research_query"].query,
+            "session_id": state["session_id"],
+            "user_profile_context": state.get("user_profile_context", ""),
+            "research_query": state["research_query"],
+            "start_time": state["start_time"],
+            "new_responses": [],
+            "new_failures": [],
+            "all_responses": list(state["agent_responses"]),
+            "all_failures": list(state["failed_agents"]),
+            "report": None,
+        }
+
+        # Map tool names to functions
+        tool_map = {t.name: t for t in self._tools}
+
+        tool_messages = []
+        for tool_call in last_message.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            tool_id = tool_call["id"]
+
+            if tool_name in tool_map:
+                try:
+                    result = await tool_map[tool_name].ainvoke(tool_args)
+                except Exception as e:
+                    logger.error("[orchestrator] Tool %s failed: %s", tool_name, e)
+                    result = f"Tool execution failed: {e}"
+            else:
+                result = f"Unknown tool: {tool_name}"
+
+            tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_id))
+
+        # Collect new responses/failures from tool context
+        new_responses = self._tool_context.get("new_responses", [])
+        new_failures = self._tool_context.get("new_failures", [])
+
+        # Update cost with agent costs
+        agent_cost = sum(r.cost_usd for r in new_responses)
+
+        # Check if build_report was called
+        report = self._tool_context.get("report")
+
+        return {
+            "messages": tool_messages,
+            "agent_responses": new_responses,
+            "failed_agents": new_failures,
+            "remaining_iterations": state["remaining_iterations"] - 1,
+            "total_cost_usd": state["total_cost_usd"] + agent_cost,
+            "report": report,
+        }
+
+    async def _node_build_final_report(self, state: OrchestratorAgentState) -> dict:
+        """Final node — ensure a report exists.
+
+        If build_report tool was already called, the report is in state.
+        Otherwise, force-build a report with whatever data exists.
+        """
+        if state["report"] is not None:
+            logger.info("[orchestrator] Report already built by tool")
+            return {}
+
+        # Force-build a report with whatever data exists
+        logger.info("[orchestrator] Forcing report build (loop exited without build_report)")
+
+        self._tool_context = {
+            "all_responses": list(state["agent_responses"]),
+            "all_failures": list(state["failed_agents"]),
+            "new_responses": [],
+            "new_failures": [],
+            "research_query": state["research_query"],
+            "start_time": state["start_time"],
+            "report": None,
+        }
+
+        await self._report_fn(
+            reasoning="Forced report — orchestrator loop exited without calling build_report",
+            _context=self._tool_context,
+        )
+
+        return {"report": self._tool_context.get("report")}
 
     # =========================================================================
     # PUBLIC API
     # =========================================================================
 
     async def run(self, query: ResearchQuery) -> ResearchReport:
-        """Execute the full research pipeline.
+        """Execute the orchestrator agent loop.
 
         This is what the API/UI calls. One method, one input, one output.
-
-        Args:
-            query: The user's research question with settings.
-
-        Returns:
-            A complete ResearchReport with all agent analyses.
+        Same interface as the old static pipeline — no changes needed
+        in routes.py or dependencies.py (beyond constructor args).
 
         LANGGRAPH CONCEPT — ainvoke():
         Runs the compiled graph asynchronously. You pass the initial state,
@@ -668,30 +514,34 @@ Synthesize these into a single coherent research summary."""
         """
         session_id = str(uuid4())
 
-        initial_state: OrchestratorState = {
-            "query": query.query,
+        user_message = f"Research query: {query.query}"
+        if query.focus_areas:
+            user_message += f"\nFocus areas: {', '.join(query.focus_areas)}"
+
+        initial_state: OrchestratorAgentState = {
+            "messages": [
+                SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
+                HumanMessage(content=user_message),
+            ],
             "research_query": query,
             "session_id": session_id,
+            "user_profile_context": "",
             "agent_responses": [],
             "failed_agents": [],
-            "conflicts": [],
-            "quality": None,
+            "remaining_iterations": self.max_iterations,
+            "total_cost_usd": 0.0,
             "report": None,
             "start_time": time.time(),
         }
 
         logger.info("[orchestrator] Starting research: %s", query.query[:80])
 
-        # Build LangSmith config — attaches metadata to the trace
-        # so you can search/filter traces in the dashboard.
-        # If LangSmith is not enabled, this is just an inert dict.
         config = get_run_config(
             query=query.query,
             session_id=session_id,
             run_name=f"research: {query.query[:50]}",
         )
 
-        # Run the graph
         final_state = await self.graph.ainvoke(initial_state, config=config)
 
         report = final_state["report"]

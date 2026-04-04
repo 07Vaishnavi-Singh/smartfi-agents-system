@@ -149,11 +149,31 @@ def create_orchestrator():
         except Exception as e:
             logger.warning("[dependencies] Postgres unavailable, episodic memory disabled: %s", e)
 
+        # Neo4j is optional — if it's not running, agents run without
+        # user profile personalization (same behavior as before KG was added).
+        # Matches the same graceful degradation pattern as Postgres above.
+        graph_memory = None
+        try:
+            from neo4j import GraphDatabase
+
+            from investment_research_system.memory.graph import GraphMemory
+
+            neo4j_driver = GraphDatabase.driver(
+                settings.neo4j_uri,
+                auth=(settings.neo4j_user, settings.neo4j_password),
+            )
+            graph_memory = GraphMemory(neo4j_driver)
+            graph_memory._ensure_indexes()  # idempotent — safe on every startup
+            logger.info("[dependencies] Neo4j graph memory connected")
+        except Exception as e:
+            logger.warning("[dependencies] Neo4j unavailable, graph memory disabled: %s", e)
+
         memory = MemoryManager(
             short_term=short_term,
             long_term=long_term,
             semantic=semantic,
             episodic=episodic,
+            graph=graph_memory,
         )
 
         tavily = TavilySearch(api_key=settings.tavily_api_key)
@@ -165,7 +185,17 @@ def create_orchestrator():
             SentimentAgent(llm=llm, memory=memory, tavily=tavily),
         ]
 
-        return ResearchOrchestrator(agents=agents, max_retries=1)
+        # Create orchestrator LLM — may use a different model than agents
+        orchestrator_model = settings.orchestrator_model or settings.default_model
+        orchestrator_llm = create_llm(orchestrator_model, settings)
+        logger.info("[dependencies] Orchestrator LLM created: %s", orchestrator_model)
+
+        return ResearchOrchestrator(
+            agents=agents,
+            memory_manager=memory,
+            orchestrator_llm=orchestrator_llm,
+            max_retries=1,
+        )
 
     except Exception as e:
         logger.exception("[dependencies] Failed to create orchestrator: %s", e)

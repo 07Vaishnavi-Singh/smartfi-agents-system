@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     max_tokens: int = 4096
     temperature: float = 0.7
 
+    # --- Orchestrator Agent ---
+    # If empty, uses default_model. Override to use a more capable model
+    # for the orchestrator's tool-calling loop (needs reliable bind_tools support).
+    orchestrator_model: str = ""
+
     # --- Cost Controls ---
     max_budget_per_query_usd: float = 0.50
 
@@ -41,8 +46,16 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dimensions: int = 384  
 
+    # --- Neo4j (Graph Memory) ---
+    # Knowledge graph for user profiles, preferences, entity relationships.
+    # bolt:// is Neo4j's binary protocol (like Redis's RESP, but for graphs).
+    # Port 7687 = Bolt (driver connects here), 7474 = browser UI (for visual exploration).
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "agent_pass"
+
     # --- Session Settings ---
-    session_ttl_seconds: int = 3600  
+    session_ttl_seconds: int = 3600
 
     class Config:
         env_file = ".env"
