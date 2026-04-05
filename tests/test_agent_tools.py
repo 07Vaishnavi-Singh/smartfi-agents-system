@@ -386,3 +386,292 @@ async def test_agent_skips_plan_still_works():
     result = await agent.run("NVIDIA", session_id="test-session")
 
     assert "Analysis without plan" in result.content
+
+
+# ============================================================================
+# Real subclass agent tests (researcher, analyst, sentiment, risk)
+# ============================================================================
+
+
+def _make_mock_llm_for_agent(plan_items=None, analysis_text="Test analysis complete."):
+    """Create a MockLLM that simulates plan → search → write_analysis flow."""
+    from langchain_core.messages import AIMessage
+
+    plan_items = plan_items or [{"topic": "test data", "source": "memory", "priority": 1}]
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AIMessage(content="", tool_calls=[
+                {"name": "create_plan", "args": {"data_needed": plan_items}, "id": "c1"}
+            ])
+        elif call_count == 2:
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_past_research", "args": {"query": plan_items[0]["topic"]}, "id": "c2"}
+            ])
+        elif call_count == 3:
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": analysis_text}, "id": "c3"}
+            ])
+        else:
+            return AIMessage(content="Done.")
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    return MockLLM()
+
+
+def _make_standard_mock_memory():
+    """Create a standard mock memory manager for agent tests."""
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={
+        "long_term": [{"text": "Past research data about NVIDIA.", "score": 0.85}],
+        "semantic": [{"memory": "NVIDIA P/E is approximately 52"}],
+        "topics": ["nvidia"],
+    })
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+    return memory
+
+
+@pytest.mark.asyncio
+async def test_researcher_agent_with_react_loop():
+    """ResearcherAgent should work with the new plan-then-execute loop."""
+    from investment_research_system.agents.researcher import ResearcherAgent
+
+    llm = _make_mock_llm_for_agent(
+        plan_items=[{"topic": "NVIDIA Q4 earnings", "source": "web", "priority": 1}],
+        analysis_text="[CONFIRMED] NVIDIA Q4 revenue was $39B, up 15% YoY.",
+    )
+    memory = _make_standard_mock_memory()
+    tavily = MagicMock()
+    tavily.search = MagicMock(return_value={"results": [], "answer": None})
+    tavily.search_as_sources = MagicMock(return_value=[])
+
+    agent = ResearcherAgent(llm=llm, memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA Q4 earnings", session_id="test-session")
+
+    assert result.agent_name == "researcher"
+    assert "NVIDIA Q4 revenue" in result.content
+    assert result.confidence > 0
+    memory.update_agent_status.assert_any_call("test-session", "researcher", "running")
+    memory.update_agent_status.assert_any_call("test-session", "researcher", "done")
+    memory.store_research.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_analyst_agent_with_react_loop():
+    """AnalystAgent should work with the new loop."""
+    from investment_research_system.agents.analyst import AnalystAgent
+
+    llm = _make_mock_llm_for_agent(
+        plan_items=[{"topic": "NVIDIA valuation", "source": "memory", "priority": 1}],
+        analysis_text="NVIDIA trades at P/E 52, fair value given 40% growth.",
+    )
+    memory = _make_standard_mock_memory()
+    tavily = MagicMock()
+    tavily.search_as_sources = MagicMock(return_value=[])
+
+    agent = AnalystAgent(llm=llm, memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA valuation analysis", session_id="test-session")
+
+    assert result.agent_name == "analyst"
+    assert "P/E 52" in result.content
+
+
+@pytest.mark.asyncio
+async def test_sentiment_agent_with_react_loop():
+    """SentimentAgent should work with the new loop."""
+    from investment_research_system.agents.sentiment import SentimentAgent
+
+    llm = _make_mock_llm_for_agent(
+        plan_items=[{"topic": "NVIDIA market sentiment", "source": "web", "priority": 1}],
+        analysis_text="Bullish sentiment: 48 buy ratings, 3 hold, 1 sell.",
+    )
+    memory = _make_standard_mock_memory()
+    tavily = MagicMock()
+    tavily.search_as_sources = MagicMock(return_value=[])
+
+    agent = SentimentAgent(llm=llm, memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA sentiment", session_id="test-session")
+
+    assert result.agent_name == "sentiment"
+    assert "Bullish" in result.content
+
+
+@pytest.mark.asyncio
+async def test_risk_agent_with_react_loop():
+    """RiskAssessorAgent should work with the new loop."""
+    from investment_research_system.agents.risk_assessor import RiskAssessorAgent
+
+    llm = _make_mock_llm_for_agent(
+        plan_items=[{"topic": "NVIDIA China export risk", "source": "web", "priority": 1}],
+        analysis_text="CRITICAL: China export ban could cut 15% of datacenter revenue.",
+    )
+    memory = _make_standard_mock_memory()
+    tavily = MagicMock()
+    tavily.search_as_sources = MagicMock(return_value=[])
+
+    agent = RiskAssessorAgent(llm=llm, memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA risks", session_id="test-session")
+
+    assert result.agent_name == "risk_assessor"
+    assert "China export ban" in result.content
+
+
+# ============================================================================
+# Edge case tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_store_failure_doesnt_crash():
+    """Agent should still return result even if memory.store_research fails."""
+    from langchain_core.messages import AIMessage
+
+    async def mock_ainvoke(messages, **kwargs):
+        return AIMessage(content="", tool_calls=[
+            {"name": "write_analysis", "args": {"content": "Analysis done."}, "id": "c1"}
+        ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock(side_effect=Exception("Redis down"))
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory)
+    result = await agent.run("test", session_id="test-session")
+
+    # Should still return despite store failure
+    assert result.content == "Analysis done."
+
+
+@pytest.mark.asyncio
+async def test_agent_with_user_profile_context():
+    """Agent should include user profile in the initial message."""
+    from langchain_core.messages import AIMessage
+
+    received_messages = []
+
+    async def mock_ainvoke(messages, **kwargs):
+        received_messages.extend(messages)
+        return AIMessage(content="", tool_calls=[
+            {"name": "write_analysis", "args": {"content": "Personalized analysis."}, "id": "c1"}
+        ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory)
+    result = await agent.run(
+        "NVIDIA investment",
+        session_id="test-session",
+        user_profile_context="[USER PROFILE]\nAge: 23-27\nRisk: moderate",
+    )
+
+    # Verify user profile was included in the human message
+    human_msg = [m for m in received_messages if hasattr(m, 'content') and 'USER PROFILE' in str(m.content)]
+    assert len(human_msg) > 0
+    assert result.content == "Personalized analysis."
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_call_failure_doesnt_crash():
+    """If a tool throws an exception mid-loop, agent should handle gracefully."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Call a search that will fail internally (mocked memory raises)
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_past_research", "args": {"query": "test"}, "id": "c1"}
+            ])
+        else:
+            # After failure, write analysis anyway
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "Analysis despite tool failure."}, "id": "c2"}
+            ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(side_effect=Exception("Qdrant down"))
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory)
+    result = await agent.run("test", session_id="test-session")
+
+    assert "Analysis despite tool failure" in result.content
+
+
+@pytest.mark.asyncio
+async def test_agent_multiple_web_searches():
+    """Agent should be able to call search_web multiple times in one loop."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_web", "args": {"query": "NVIDIA earnings"}, "id": "c1"}
+            ])
+        elif call_count == 2:
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_web", "args": {"query": "NVIDIA China risk", "topic": "news"}, "id": "c2"}
+            ])
+        else:
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "Comprehensive analysis with multiple searches."}, "id": "c3"}
+            ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    tavily = MagicMock()
+    tavily.search = MagicMock(return_value={
+        "results": [{"title": "Result", "content": "Data", "url": "http://x", "published_date": ""}],
+    })
+
+    memory = AsyncMock()
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA full analysis", session_id="test-session")
+
+    assert "Comprehensive analysis" in result.content
+    # Tavily should have been called twice
+    assert tavily.search.call_count == 2
