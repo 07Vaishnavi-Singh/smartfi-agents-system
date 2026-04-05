@@ -173,3 +173,216 @@ async def test_write_analysis_sets_content_and_exits():
 
     assert context["analysis"] == "NVIDIA revenue $39B, P/E 52, China export risk moderate."
     assert "analysis complete" in result.lower() or "written" in result.lower()
+
+
+# ============================================================================
+# Full agent loop tests
+# ============================================================================
+
+
+def _make_concrete_agent(llm, memory, tavily=None, max_tool_turns=5):
+    """Create a concrete agent subclass for testing."""
+    from investment_research_system.agents.base import BaseAgent
+
+    class TestAgent(BaseAgent):
+        @property
+        def name(self) -> str:
+            return "test_agent"
+
+        @property
+        def system_prompt(self) -> str:
+            return "You are a test agent. Use tools to gather data, then call write_analysis."
+
+    return TestAgent(llm=llm, memory=memory, tavily=tavily, max_tool_turns=max_tool_turns)
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_then_execute_happy_path():
+    """Full loop: plan → search → write_analysis → AgentResponse."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Plan
+            return AIMessage(content="", tool_calls=[
+                {"name": "create_plan", "args": {"data_needed": [{"topic": "NVIDIA earnings", "source": "web", "priority": 1}]}, "id": "c1"}
+            ])
+        elif call_count == 2:
+            # Search
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_past_research", "args": {"query": "NVIDIA earnings"}, "id": "c2"}
+            ])
+        elif call_count == 3:
+            # Write analysis
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "NVIDIA revenue is $39B with strong growth."}, "id": "c3"}
+            ])
+        else:
+            return AIMessage(content="Done.")
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory)
+    result = await agent.run("NVIDIA earnings", session_id="test-session")
+
+    assert result.agent_name == "test_agent"
+    assert "NVIDIA revenue is $39B" in result.content
+    assert result.tokens_used >= 0
+
+
+@pytest.mark.asyncio
+async def test_agent_max_turns_forces_output():
+    """When max turns hit without write_analysis, use last LLM message content."""
+    from langchain_core.messages import AIMessage
+
+    async def always_search(messages, **kwargs):
+        return AIMessage(content="", tool_calls=[
+            {"name": "search_past_research", "args": {"query": "test"}, "id": "c_loop"}
+        ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await always_search(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory, max_tool_turns=2)
+    result = await agent.run("test", session_id="test-session")
+
+    # Should still return an AgentResponse (forced output)
+    assert result is not None
+    assert result.agent_name == "test_agent"
+
+
+@pytest.mark.asyncio
+async def test_agent_cost_accumulates_across_turns():
+    """Token count should be the sum across all LLM calls in the loop."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            msg = AIMessage(content="", tool_calls=[
+                {"name": "search_past_research", "args": {"query": "test"}, "id": f"c{call_count}"}
+            ])
+        else:
+            msg = AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "Final analysis."}, "id": f"c{call_count}"}
+            ])
+        # Simulate 100 tokens per call
+        msg.usage_metadata = {"input_tokens": 80, "output_tokens": 20}
+        return msg
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory)
+    result = await agent.run("test", session_id="test-session")
+
+    # 3 LLM calls × 100 tokens each = 300 total
+    assert result.tokens_used == 300
+
+
+@pytest.mark.asyncio
+async def test_agent_no_tavily_still_works():
+    """Agent with tavily=None should work — search_web returns unavailable."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_web", "args": {"query": "NVIDIA"}, "id": "c1"}
+            ])
+        else:
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "Analysis without web data."}, "id": "c2"}
+            ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory, tavily=None)
+    result = await agent.run("NVIDIA", session_id="test-session")
+
+    assert "Analysis without web data" in result.content
+
+
+@pytest.mark.asyncio
+async def test_agent_skips_plan_still_works():
+    """Agent that goes straight to search without create_plan should still work."""
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Skip plan, go straight to search
+            return AIMessage(content="", tool_calls=[
+                {"name": "search_web", "args": {"query": "NVIDIA"}, "id": "c1"}
+            ])
+        else:
+            return AIMessage(content="", tool_calls=[
+                {"name": "write_analysis", "args": {"content": "Analysis without plan."}, "id": "c2"}
+            ])
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    tavily = MagicMock()
+    tavily.search = MagicMock(return_value={"results": [{"title": "NVIDIA", "content": "Data", "url": "http://x", "published_date": ""}]})
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.update_agent_status = AsyncMock()
+    memory.store_research = AsyncMock()
+
+    agent = _make_concrete_agent(llm=MockLLM(), memory=memory, tavily=tavily)
+    result = await agent.run("NVIDIA", session_id="test-session")
+
+    assert "Analysis without plan" in result.content
