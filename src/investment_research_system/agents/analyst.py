@@ -86,7 +86,8 @@ Do NOT:
 DO:
 - Quantify everything possible
 - Flag when you're working with incomplete data: "Cannot assess FCF — no cash flow statement available"
-- Note when metrics conflict: "P/E suggests overvalued but PEG of 1.2 suggests fair value given growth""""
+- Note when metrics conflict: "P/E suggests overvalued but PEG of 1.2 suggests fair value given growth"
+"""
 
     def build_query(self, query: str, memory_results: dict) -> str:
         """Build a financially-focused prompt using memory context.

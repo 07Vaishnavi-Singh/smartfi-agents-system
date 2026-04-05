@@ -152,6 +152,7 @@ class BaseAgent(ABC):
         llm: ChatAnthropic,
         memory: MemoryManager,
         tavily: TavilySearch | None = None,
+        max_tool_turns: int = 5,
         fallback_llms: list | None = None,
     ):
         """Initialize with shared dependencies.
@@ -167,11 +168,14 @@ class BaseAgent(ABC):
             llm: LangChain chat model instance (shared across agents).
             memory: MemoryManager for searching/storing research.
             tavily: Optional web search tool. Not all agents need it.
+            max_tool_turns: Max LLM calls in the plan-then-execute loop.
+                Default 5 = 1 plan + 3 searches + 1 write.
             fallback_llms: Optional list of backup LLMs to try on rate limit.
         """
         self.llm = llm
         self.memory = memory
         self.tavily = tavily
+        self.max_tool_turns = max_tool_turns
         self.fallback_llms = fallback_llms or []
 
     # =========================================================================
@@ -211,18 +215,18 @@ class BaseAgent(ABC):
         ...
 
     # =========================================================================
-    # ABSTRACT METHODS — subclasses MUST implement these
+    # OPTIONAL OVERRIDES — subclasses CAN override these for backward compat
     # =========================================================================
 
-    @abstractmethod
     def build_query(self, query: str, memory_results: dict) -> str:
         """Build the prompt to send to Claude, using memory context.
 
-        Each agent frames its question differently:
-        - Researcher adds past research context
-        - Analyst focuses on financial data
-        - Risk agent emphasizes potential downsides
-        - Sentiment agent focuses on market mood
+        BACKWARD COMPATIBILITY: This was previously abstract. Subclasses that
+        override it will have their implementation used as additional context
+        in the initial user message. If not overridden, the raw query is used.
+
+        With the new plan-then-execute loop, the LLM decides what to search
+        via tools, so build_query is no longer the primary prompt builder.
 
         Args:
             query: The user's original question.
@@ -231,14 +235,14 @@ class BaseAgent(ABC):
         Returns:
             The formatted prompt string to send to Claude.
         """
-        ...
+        return query
 
-    @abstractmethod
     def extract_sources(self, query: str) -> list[Source]:
         """Gather sources relevant to this agent's analysis.
 
-        Some agents use Tavily (researcher), others use memory (analyst),
-        some use both. Each agent defines its own source-gathering strategy.
+        BACKWARD COMPATIBILITY: This was previously abstract. Subclasses
+        that override it still work. With the new loop, sources are gathered
+        via the search_web tool instead.
 
         Args:
             query: The user's original question.
@@ -246,7 +250,7 @@ class BaseAgent(ABC):
         Returns:
             List of Source objects to include in AgentResponse.
         """
-        ...
+        return []
 
     # =========================================================================
     # CONCRETE METHODS — shared by all agents, no override needed
@@ -255,22 +259,19 @@ class BaseAgent(ABC):
     async def run(
         self, query: str, session_id: str, user_profile_context: str = "",
     ) -> AgentResponse:
-        """Execute this agent's full pipeline.
+        """Execute this agent's plan-then-execute loop.
 
-        This is the main method the orchestrator calls. It:
-        1. Searches memory for relevant past knowledge
-        2. Gathers sources (web search, memory, etc.)
-        3. Buils a prompt with contdext
-        4. Prepends user profile from Neo4j (if available)
-        5. Calls Claude
-        6. Tracks tokens and cost
-        7. Stores results back to memory
-        8. Returns a standardized AgentResponse
+        PLAN-THEN-EXECUTE PATTERN:
+        1. LLM creates a plan (what data it needs)
+        2. LLM executes the plan (search_web, search_past_research)
+        3. LLM writes its analysis (write_analysis — exit tool)
 
-        PYTHON CONCEPT — async def:
-        This is async because memory and LLM calls are I/O operations.
-        The orchestrator can run multiple agents concurrently with
-        asyncio.gather() — same as Promise.all() in TS.
+        The LLM has 4 tools and max_tool_turns iterations. If it doesn't
+        call write_analysis by the limit, the last message content is used.
+
+        This replaces the old single-shot pipeline. The key difference:
+        the LLM decides what to search and when it has enough data,
+        guided by the system prompt from each subclass.
 
         Args:
             query: The user's original research question.
@@ -282,108 +283,181 @@ class BaseAgent(ABC):
         Returns:
             AgentResponse with analysis, sources, and cost tracking.
         """
-        logger.info("[%s] Starting analysis for: %s", self.name, query[:80])
-        start_time = time.time()
+        from langchain_core.messages import ToolMessage
+        from langchain_core.tools import tool
 
-        # Step 1: Update status in Redis
-        await self.memory.update_agent_status(session_id, self.name, "running")
-
-        # Step 2: Search memory for past knowledge
-        try:
-            memory_results = await self.memory.parallel_search(query)
-        except Exception as e:
-            raise MemoryUnavailableError(self.name, f"Memory search failed: {e}") from e
-        logger.info(
-            "[%s] Memory search returned %d long-term, %d semantic results",
-            self.name,
-            len(memory_results.get("long_term", [])),
-            len(memory_results.get("semantic", [])),
+        from investment_research_system.agents.agent_tools import (
+            create_plan_tool,
+            create_search_past_research_tool,
+            create_search_web_tool,
+            create_write_analysis_tool,
         )
 
-        # Step 3: Gather sources (each agent implements its own strategy)
-        sources = self.extract_sources(query)
+        logger.info("[%s] Starting plan-then-execute for: %s", self.name, query[:80])
+        start_time = time.time()
 
-        # Step 4: Build the prompt with memory context
-        user_prompt = self.build_query(query, memory_results)
+        # Update status in Redis
+        await self.memory.update_agent_status(session_id, self.name, "running")
 
-        # Step 4b: Prepend user profile context (from Neo4j Graph 1).
-        # The profile is injected ABOVE the DATA BLOCK so the agent sees it
-        # first — avoids the "lost in the middle" problem where context buried
-        # deep in the prompt gets ignored by the LLM.
-        # If user_profile_context is empty (no user, Neo4j down), this is a no-op.
-        if user_profile_context:
-            user_prompt = f"{user_profile_context}\n\n{user_prompt}"
+        # Create tool factory functions
+        plan_fn = create_plan_tool()
+        search_web_fn = create_search_web_tool(tavily=self.tavily)
+        search_memory_fn = create_search_past_research_tool(memory=self.memory)
+        write_fn = create_write_analysis_tool()
 
-        # Step 5: Call Claude via LangChain
-        # Append structured output instruction to the system prompt so
-        # the LLM returns JSON with an explicit status field.
-        # This is done here (not in each agent's system_prompt) to keep
-        # it centralized — agents don't need to know about this.
+        # Mutable context shared with tools
+        tool_context = {
+            "plan": None,
+            "analysis": None,
+        }
+
+        # Create @tool wrappers for bind_tools schema generation
+        @tool
+        async def create_plan(data_needed: list[dict]) -> str:
+            """Create a research plan listing what data to gather.
+            Each item: {topic: str, source: "web"|"memory", priority: 1|2}."""
+            return await plan_fn(data_needed, _context=tool_context)
+
+        @tool
+        async def search_web(query: str, topic: str = "finance", time_range: str | None = None) -> str:
+            """Search the web for current information. topic: finance/news/general."""
+            return await search_web_fn(query, topic=topic, time_range=time_range)
+
+        @tool
+        async def search_past_research(query: str) -> str:
+            """Search past research in memory (Qdrant + Mem0)."""
+            return await search_memory_fn(query)
+
+        @tool
+        async def write_analysis(content: str) -> str:
+            """Write your final analysis. Call when you have enough data."""
+            return await write_fn(content, _context=tool_context)
+
+        tools = [create_plan, search_web, search_past_research, write_analysis]
+
+        # Bind tools to LLM
+        try:
+            llm_with_tools = self.llm.bind_tools(tools)
+        except Exception as e:
+            logger.warning("[%s] bind_tools() failed: %s. Using unbound LLM.", self.name, e)
+            llm_with_tools = self.llm
+
+        # Build initial messages
         full_system_prompt = self.system_prompt + STRUCTURED_OUTPUT_INSTRUCTION
 
-        # SECURITY — XML delimiter defense (Layer 2):
-        # Wrap the user-generated prompt in <user_query> tags so the LLM
-        # can distinguish between system instructions and user data.
-        # Same principle as parameterized SQL queries — separate code from data.
-        # The system prompt tells Claude to treat <user_query> content as DATA,
-        # not as instructions to follow.
-        wrapped_prompt = f"<user_query>\n{user_prompt}\n</user_query>"
+        user_message = f"<user_query>\n{query}\n</user_query>"
+        if user_profile_context:
+            user_message = f"{user_profile_context}\n\n{user_message}"
 
         messages = [
             SystemMessage(content=full_system_prompt),
-            HumanMessage(content=wrapped_prompt),
+            HumanMessage(content=user_message),
         ]
 
-        # Call LLM with automatic fallback on rate limits.
-        # Tries self.llm first, then each fallback model in order.
-        response: AIMessage = await self._call_llm_with_fallback(messages)
+        # =====================================================================
+        # PLAN-THEN-EXECUTE LOOP
+        # =====================================================================
+        total_tokens = 0
+        total_cost = 0.0
+        tool_map = {t.name: t for t in tools}
 
-        # Validate response content
-        if not response.content or not response.content.strip():
-            raise LLMOutputError(self.name, "LLM returned empty response")
+        for turn in range(self.max_tool_turns):
+            # Call LLM
+            try:
+                async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
+                    response = await llm_with_tools.ainvoke(messages)
+            except TimeoutError:
+                raise LLMTimeoutError(
+                    self.name,
+                    f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS}s",
+                )
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "rate" in error_msg and "limit" in error_msg:
+                    raise LLMRateLimitError(self.name, f"Rate limited: {e}") from e
+                if "429" in str(e):
+                    raise LLMRateLimitError(self.name, f"Rate limited (429): {e}") from e
+                raise
 
-        # Step 6: Parse structured response and check for refusal
-        analysis_content = self._parse_structured_response(response.content)
+            # Track tokens for this turn
+            usage = getattr(response, "usage_metadata", None) or {}
+            if isinstance(usage, dict):
+                input_t = usage.get("input_tokens", 0)
+                output_t = usage.get("output_tokens", 0)
+                total_tokens += input_t + output_t
+                total_cost += (input_t * COST_PER_INPUT_TOKEN) + (output_t * COST_PER_OUTPUT_TOKEN)
 
-        # Step 7: Calculate tokens and cost
-        token_usage = response.usage_metadata or {}
-        # PYTHON CONCEPT — duck typing:
-        # We don't check the type of usage_metadata. We just call .get()
-        # on it. If it's a dict, great. If it's None, we used `or {}`.
-        # Python doesn't care about the type — only that it has .get().
-        # TS would need: (response.usage_metadata as Record<string, number>)
-        input_tokens = token_usage.get("input_tokens", 0)
-        output_tokens = token_usage.get("output_tokens", 0)
-        total_tokens = input_tokens + output_tokens
-        cost = (input_tokens * COST_PER_INPUT_TOKEN) + (output_tokens * COST_PER_OUTPUT_TOKEN)
+            messages.append(response)
+
+            # Check if LLM wants to call tools
+            if not hasattr(response, "tool_calls") or not response.tool_calls:
+                # No tool calls — LLM is done (or didn't use tools)
+                break
+
+            # Execute tool calls sequentially
+            for tc in response.tool_calls:
+                tool_name = tc["name"]
+                tool_args = tc["args"]
+                tool_id = tc["id"]
+
+                if tool_name in tool_map:
+                    try:
+                        result = await tool_map[tool_name].ainvoke(tool_args)
+                    except Exception as e:
+                        logger.error("[%s] Tool %s failed: %s", self.name, tool_name, e)
+                        result = f"Tool failed: {e}"
+                else:
+                    result = f"Unknown tool: {tool_name}"
+
+                messages.append(ToolMessage(content=str(result), tool_call_id=tool_id))
+
+            # Check if write_analysis was called (exit condition)
+            if tool_context["analysis"] is not None:
+                logger.info("[%s] write_analysis called on turn %d", self.name, turn + 1)
+                break
+
+        # =====================================================================
+        # BUILD RESPONSE
+        # =====================================================================
+
+        # Get the analysis content
+        if tool_context["analysis"] is not None:
+            analysis_content = tool_context["analysis"]
+        elif response.content and response.content.strip():
+            # Max turns hit or LLM returned text without calling write_analysis
+            logger.info("[%s] Forced output from last LLM message (no write_analysis called)", self.name)
+            analysis_content = response.content
+        else:
+            analysis_content = "Agent could not produce analysis within the allowed turns."
 
         elapsed_ms = (time.time() - start_time) * 1000
 
-        # Step 8: Store results in memory for future queries
-        # Pass topics so the stored research is tagged for future topic-filtered retrieval.
-        await self.memory.store_research(
-            content=analysis_content,
-            agent_name=self.name,
-            session_id=session_id,
-            metadata={"query_context": query},
-            topics=memory_results.get("topics"),
-        )
+        # Store results in memory for future queries
+        try:
+            await self.memory.store_research(
+                content=analysis_content,
+                agent_name=self.name,
+                session_id=session_id,
+                metadata={"query_context": query},
+            )
+        except Exception as e:
+            logger.warning("[%s] Failed to store research: %s", self.name, e)
 
-        # Step 9: Update status to done
+        # Update status to done
         await self.memory.update_agent_status(session_id, self.name, "done")
 
         logger.info(
-            "[%s] Complete in %.0fms | %d tokens | $%.4f",
-            self.name, elapsed_ms, total_tokens, cost,
+            "[%s] Complete in %.0fms | %d tokens | $%.4f | %d turns",
+            self.name, elapsed_ms, total_tokens, total_cost, turn + 1,
         )
 
         return AgentResponse(
             agent_name=self.name,
             content=analysis_content,
-            confidence=self._estimate_confidence(analysis_content, memory_results),
-            sources=sources,
+            confidence=self._estimate_confidence(analysis_content, {"long_term": [], "semantic": []}),
+            sources=self.extract_sources(query),
             tokens_used=total_tokens,
-            cost_usd=cost,
+            cost_usd=total_cost,
             latency_ms=elapsed_ms,
         )
 
