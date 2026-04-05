@@ -93,6 +93,7 @@ If present, you MUST tailor your analysis to this user's specific context:
   is specifically relevant. Suggest diversification gaps.
 If [USER PROFILE] is NOT present, provide generic analysis (no assumptions about the user).
 
+
 --- GROUNDING RULE ---
 
 The human message contains a DATA BLOCK with labeled items ([FACT-1], [RESEARCH-1], etc.).
@@ -152,6 +153,7 @@ class BaseAgent(ABC):
         memory: MemoryManager,
         tavily: TavilySearch | None = None,
         max_tool_turns: int = 5,
+        fallback_llms: list | None = None,
     ):
         """Initialize with shared dependencies.
 
@@ -163,16 +165,18 @@ class BaseAgent(ABC):
         - Config lives in ONE place (whoever creates these objects)
 
         Args:
-            llm: LangChain ChatAnthropic instance (shared across agents).
+            llm: LangChain chat model instance (shared across agents).
             memory: MemoryManager for searching/storing research.
             tavily: Optional web search tool. Not all agents need it.
             max_tool_turns: Max LLM calls in the plan-then-execute loop.
                 Default 5 = 1 plan + 3 searches + 1 write.
+            fallback_llms: Optional list of backup LLMs to try on rate limit.
         """
         self.llm = llm
         self.memory = memory
         self.tavily = tavily
         self.max_tool_turns = max_tool_turns
+        self.fallback_llms = fallback_llms or []
 
     # =========================================================================
     # ABSTRACT PROPERTIES — subclasses MUST define these
@@ -454,6 +458,65 @@ class BaseAgent(ABC):
             cost_usd=total_cost,
             latency_ms=elapsed_ms,
         )
+
+    async def _call_llm_with_fallback(self, messages: list) -> AIMessage:
+        """Call LLM with automatic fallback on rate limit errors.
+
+        Tries self.llm first, then each fallback in order.
+        Only falls back on rate limits (429) — other errors propagate immediately.
+
+        This is transparent to the orchestrator — it just gets a response
+        regardless of which model answered.
+
+        PYTHON CONCEPT — getattr(obj, attr, default):
+        Safely reads an attribute. If the object doesn't have it, returns default.
+        Used here because different LangChain chat models store the model name
+        in different attributes. getattr is like optional chaining in TS: obj?.attr ?? default
+        """
+        all_llms = [self.llm] + self.fallback_llms
+
+        for i, llm in enumerate(all_llms):
+            try:
+                async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
+                    response = await llm.ainvoke(messages)
+                if i > 0:
+                    model_name = getattr(llm, "model", "unknown")
+                    logger.info(
+                        "[%s] Fallback model #%d (%s) succeeded",
+                        self.name, i + 1, model_name,
+                    )
+                return response
+            except TimeoutError:
+                raise LLMTimeoutError(
+                    self.name,
+                    f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS}s",
+                )
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_rate_limit = (
+                    ("rate" in error_msg and "limit" in error_msg)
+                    or "429" in str(e)
+                    or "resource_exhausted" in error_msg
+                )
+
+                if is_rate_limit and i < len(all_llms) - 1:
+                    model_name = getattr(llm, "model", "unknown")
+                    logger.warning(
+                        "[%s] Model %s rate limited, falling back to next model",
+                        self.name, model_name,
+                    )
+                    continue
+
+                if is_rate_limit:
+                    raise LLMRateLimitError(
+                        self.name, f"All {len(all_llms)} models exhausted. Last error: {e}"
+                    ) from e
+
+                # Non-rate-limit error — propagate immediately
+                raise
+
+        # Should never reach here, but just in case
+        raise LLMRateLimitError(self.name, "All fallback models exhausted")
 
     def _estimate_confidence(self, content: str, memory_results: dict) -> float:
         """Estimate confidence based on response quality signals.
