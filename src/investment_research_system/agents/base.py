@@ -276,7 +276,9 @@ class BaseAgent(ABC):
         Args:
             query: The user's original research question.
             session_id: Current session ID for memory tracking.
-            user_profile_context: Pre-formatted user profile from Neo4j.
+            user_profile_context: Pre-formatted user profile from Neo4j Graph 1.
+                Fetched once in the orchestrator and shared by all agents.
+                Empty string if no user or Neo4j is down (graceful degradation).
 
         Returns:
             AgentResponse with analysis, sources, and cost tracking.
