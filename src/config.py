@@ -39,6 +39,8 @@ class Settings(BaseSettings):
 
     # --- Cost Controls ---
     max_budget_per_query_usd: float = 0.50
+    user_daily_budget_usd: float = 5.00
+    budget_warning_threshold: float = 0.80  # alert at 80% of budget
 
     # --- Embedding Settings ---
     # We'll use a local embedding model (free, no API key needed)

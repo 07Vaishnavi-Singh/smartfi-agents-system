@@ -15,6 +15,8 @@ Mem0 automatically:
 """
 
 import logging
+import os
+import shutil
 
 from mem0 import Memory
 
@@ -51,9 +53,65 @@ class SemanticMemory:
                     "config": {"model": "all-MiniLM-L6-v2"},
                 },
             }
-        self.memory = Memory.from_config(config)
+        self._config = config
+        self._did_dimension_recovery = False
+        self.memory = Memory.from_config(self._config)
 
         logger.info("Semantic memory (Mem0) initialized")
+
+    @staticmethod
+    def _is_dimension_mismatch(error: Exception) -> bool:
+        """Detect embedding/vector dimension mismatch errors from Mem0/Qdrant."""
+        msg = str(error).lower()
+        return (
+            "not aligned" in msg
+            or "vector size" in msg
+            or "dimension" in msg
+            or "shapes (" in msg
+        )
+
+    def _reset_local_mem0_vector_store(self) -> None:
+        """Reset local Mem0 qdrant storage to rebuild with current embedding size.
+
+        This is a developer-safety recovery path for local mismatched stores
+        (for example old 1536-d vectors with current 384-d embedder).
+        """
+        mem0_dir = os.path.expanduser("~/.mem0")
+        qdrant_migrations_dir = os.path.join(mem0_dir, "migrations_qdrant")
+        history_db = os.path.join(mem0_dir, "history.db")
+
+        removed_any = False
+        if os.path.isdir(qdrant_migrations_dir):
+            shutil.rmtree(qdrant_migrations_dir, ignore_errors=True)
+            removed_any = True
+
+        # Mem0 keeps metadata/history in SQLite locally; clearing it avoids
+        # stale vector metadata that can still reference old dimensions.
+        if os.path.isfile(history_db):
+            try:
+                os.remove(history_db)
+                removed_any = True
+            except OSError:
+                pass
+
+        if removed_any:
+            logger.warning(
+                "Semantic memory mismatch detected. Reset local Mem0 storage at %s",
+                mem0_dir,
+            )
+
+    def _recover_from_dimension_mismatch(self, error: Exception) -> bool:
+        """Attempt one-time recovery from local vector dimension mismatch."""
+        if self._did_dimension_recovery or not self._is_dimension_mismatch(error):
+            return False
+
+        self._did_dimension_recovery = True
+        self._reset_local_mem0_vector_store()
+        self.memory = Memory.from_config(self._config)
+        logger.warning(
+            "Semantic memory reinitialized after vector dimension mismatch; retrying operation once."
+        )
+        return True
 
     def store(self, content: str, agent_name: str, metadata: dict | None = None) -> dict:
         """Store a fact. Mem0 auto-deduplicates.
@@ -75,11 +133,21 @@ class SemanticMemory:
         Python's `or` returns the first truthy value.
         Same as `metadata ?? {}` in TS.
         """
-        result = self.memory.add(
-            content,
-            user_id=agent_name,
-            metadata=metadata or {},
-        )
+        try:
+            result = self.memory.add(
+                content,
+                user_id=agent_name,
+                metadata=metadata or {},
+            )
+        except Exception as e:
+            if self._recover_from_dimension_mismatch(e):
+                result = self.memory.add(
+                    content,
+                    user_id=agent_name,
+                    metadata=metadata or {},
+                )
+            else:
+                raise
         logger.info("Stored fact for %s: %s", agent_name, content[:80])
         return result
 
@@ -107,7 +175,13 @@ class SemanticMemory:
         kwargs: dict = {"query": query, "limit": limit}
         kwargs["user_id"] = agent_name or "system"
 
-        results = self.memory.search(**kwargs)
+        try:
+            results = self.memory.search(**kwargs)
+        except Exception as e:
+            if self._recover_from_dimension_mismatch(e):
+                results = self.memory.search(**kwargs)
+            else:
+                raise
         return results.get("results", [])
         # ^ .get("results", []) = safe access with fallback
         #   TS equivalent: results?.results ?? []
