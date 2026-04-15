@@ -1,2 +1,2 @@
 LLD Architecture 
-<img width="1004" height="682" alt="image" src="https://github.com/user-attachments/assets/83bf4b60-bf34-4a65-b651-30ff6f17c88d" />
+<img width="987" height="670" alt="image" src="https://github.com/user-attachments/assets/cf0c7396-1139-4644-ae98-fa289ce89db2" />
