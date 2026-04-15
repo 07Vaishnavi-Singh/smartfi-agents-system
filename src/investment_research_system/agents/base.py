@@ -348,7 +348,6 @@ class BaseAgent(ABC):
         search_web_fn = create_search_web_tool(tavily=self.tavily)
         search_memory_fn = create_search_past_research_tool(memory=self.memory)
         write_fn = create_write_analysis_tool()
-
         # Mutable context shared with tools
         tool_context = {
             "plan": None,
@@ -472,7 +471,6 @@ class BaseAgent(ABC):
                 output_t = usage.get("output_tokens", 0)
                 total_tokens += input_t + output_t
                 total_cost += (input_t * COST_PER_INPUT_TOKEN) + (output_t * COST_PER_OUTPUT_TOKEN)
-
             messages.append(response)
 
             # Check if LLM wants to call tools
