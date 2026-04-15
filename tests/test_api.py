@@ -5,6 +5,7 @@ Run: PYTHONPATH=src uv run pytest tests/test_api.py -v
 
 import os
 import sys
+import asyncio
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -227,3 +228,33 @@ def test_run_config_structure():
     assert "tags" in config
     assert "investment-research" in config["tags"]
     assert config["run_name"] == "test run"
+
+
+@pytest.mark.asyncio
+async def test_run_research_job_times_out_and_marks_failed(monkeypatch):
+    """Background job should never remain running forever on hangs."""
+    from investment_research_system.api.job_store import JobStore
+    from investment_research_system.api.routes import ResearchRequest, _run_research_job
+    import investment_research_system.api.routes as routes_module
+
+    class SlowOrchestrator:
+        async def run(self, query):
+            await asyncio.sleep(0.05)
+
+    store = JobStore()
+    job_id = store.create(query="timeout test")
+    request = ResearchRequest(query="timeout test")
+
+    monkeypatch.setattr(routes_module, "RESEARCH_JOB_TIMEOUT_SECONDS", 0.01)
+
+    await _run_research_job(
+        job_id=job_id,
+        request=request,
+        store=store,
+        orchestrator_factory=lambda: SlowOrchestrator(),
+    )
+
+    job = store.get(job_id)
+    assert job is not None
+    assert job["status"] == "failed"
+    assert "timed out" in (job["error"] or "").lower()

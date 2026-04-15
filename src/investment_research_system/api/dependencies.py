@@ -31,7 +31,14 @@ logger = logging.getLogger(__name__)
 # Python modules are singletons. When you import this module,
 # these objects are created once. Every subsequent import reuses them.
 # TS equivalent: a module-scoped let/const
-_job_store = JobStore()
+#
+# The JobStore now uses Redis for persistence (survives pod restarts).
+# Falls back to in-memory dict if Redis is unavailable.
+try:
+    from config import settings as _settings
+    _job_store = JobStore(redis_url=_settings.redis_url)
+except Exception:
+    _job_store = JobStore()  # fallback — uses in-memory dict
 
 
 def get_job_store() -> JobStore:

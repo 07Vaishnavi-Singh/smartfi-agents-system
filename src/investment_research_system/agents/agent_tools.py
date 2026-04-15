@@ -70,12 +70,20 @@ def create_plan_tool():
 def create_search_web_tool(tavily):
     """Factory: create the search_web async function.
 
+    Includes an in-memory Tavily search cache scoped to this dispatch step.
+    Within the same orchestrator execution, duplicate Tavily queries hit
+    cache instead of the API — saves $0.01/search and avoids rate limits.
+
     Args:
         tavily: TavilySearch instance, or None if unavailable.
 
     Returns:
         An async function that takes (query, topic, time_range) and returns str.
     """
+    # In-memory cache scoped to this tool instance (= one orchestrator run).
+    # Not Redis — this only needs to deduplicate within the same session.
+    # If researcher and analyst both search "NVIDIA revenue", second is free.
+    _tavily_cache: dict[str, str] = {}
 
     async def search_web(query: str, topic: str = "finance", time_range: str | None = None) -> str:
         """Search the web for current information using Tavily.
@@ -87,6 +95,13 @@ def create_search_web_tool(tavily):
         """
         if tavily is None:
             return "Web search unavailable — no Tavily API configured. Use search_past_research instead."
+
+        # TAVILY CACHE — check if this exact query was already searched
+        # in this session. Saves $0.01/search when agents search overlapping queries.
+        cache_key = f"{query.lower().strip()}|{topic}|{time_range}"
+        if cache_key in _tavily_cache:
+            logger.info("[agent_tools] Tavily cache HIT for: %s", query[:50])
+            return _tavily_cache[cache_key]
 
         try:
             results = await asyncio.to_thread(
@@ -118,7 +133,11 @@ def create_search_web_tool(tavily):
             parts.append(f"\nSummary: {answer}")
 
         logger.info("[agent_tools] Web search for '%s': %d results", query[:50], len(items))
-        return "\n\n".join(parts)
+        result_text = "\n\n".join(parts)
+
+        # Store in cache for this session
+        _tavily_cache[cache_key] = result_text
+        return result_text
 
     return search_web
 

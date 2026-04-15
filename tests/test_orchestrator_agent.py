@@ -1,7 +1,7 @@
-"""Tests for the orchestrator agent — ReAct loop with tool calling.
+"""Tests for the plan-then-execute orchestrator.
 
 Tests the orchestrator tools (dispatch_agents, search_memory, build_report),
-the StateGraph loop, stopping conditions, and edge cases.
+plan validation, the StateGraph loop, replanning, and edge cases.
 
 Run: uv run pytest tests/test_orchestrator_agent.py -v
 """
@@ -255,13 +255,255 @@ async def test_build_report_tool_with_responses():
 
 
 # ============================================================================
-# Task 4: Full orchestrator loop
+# Task 4: Agent filtering (code-level pre-check)
+# ============================================================================
+
+
+def test_filter_skips_researcher_with_enough_memory():
+    """Researcher should be skipped when memory has ≥3 high-relevance items."""
+    from investment_research_system.orchestrator.graph import filter_available_agents
+
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.92): NVIDIA Q4 revenue was $39.3B\n"
+        "[RESEARCH-2] (relevance: 0.88): NVIDIA operating margin 57%\n"
+        "[RESEARCH-3] (relevance: 0.90): NVIDIA data center revenue $35.1B\n"
+        "[FACT-1]: NVIDIA P/E is 58"
+    )
+    skip = filter_available_agents(memory_context)
+    assert skip["researcher"] is True
+    assert skip["analyst"] is False  # never skipped
+    assert skip["risk_assessor"] is False  # never skipped
+
+
+def test_filter_keeps_researcher_with_few_memory_items():
+    """Researcher should NOT be skipped with <3 high-relevance items."""
+    from investment_research_system.orchestrator.graph import filter_available_agents
+
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.92): NVIDIA Q4 revenue was $39.3B\n"
+        "[RESEARCH-2] (relevance: 0.60): Some low relevance result\n"
+    )
+    skip = filter_available_agents(memory_context)
+    assert skip["researcher"] is False  # only 1 high-relevance item
+
+
+def test_filter_skips_sentiment_with_sentiment_facts():
+    """Sentiment should be skipped when memory has sentiment-related facts."""
+    from investment_research_system.orchestrator.graph import filter_available_agents
+
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.70): Some research\n"
+        "[FACT-1]: Market sentiment is bullish for NVIDIA\n"
+    )
+    skip = filter_available_agents(memory_context)
+    assert skip["sentiment"] is True
+
+
+def test_filter_keeps_sentiment_without_sentiment_facts():
+    """Sentiment should NOT be skipped when no sentiment data in memory."""
+    from investment_research_system.orchestrator.graph import filter_available_agents
+
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.92): Revenue data\n"
+        "[FACT-1]: NVIDIA P/E is 58\n"
+    )
+    skip = filter_available_agents(memory_context)
+    assert skip["sentiment"] is False
+
+
+def test_filter_never_skips_analyst_or_risk():
+    """Analyst and risk_assessor should NEVER be skipped."""
+    from investment_research_system.orchestrator.graph import filter_available_agents
+
+    # Even with tons of memory data
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.95): Data 1\n"
+        "[RESEARCH-2] (relevance: 0.93): Data 2\n"
+        "[RESEARCH-3] (relevance: 0.91): Data 3\n"
+        "[FACT-1]: Market sentiment is very bullish\n"
+        "[FACT-2]: Analyst rating is strong buy\n"
+    )
+    skip = filter_available_agents(memory_context)
+    assert skip["analyst"] is False
+    assert skip["risk_assessor"] is False
+
+
+def test_get_available_agents_filters_correctly():
+    """get_available_agents should return only non-skipped agents."""
+    from investment_research_system.orchestrator.graph import get_available_agents
+
+    # Enough to skip researcher + sentiment
+    memory_context = (
+        "[RESEARCH-1] (relevance: 0.95): Data 1\n"
+        "[RESEARCH-2] (relevance: 0.93): Data 2\n"
+        "[RESEARCH-3] (relevance: 0.91): Data 3\n"
+        "[FACT-1]: Bearish sentiment dominates\n"
+    )
+    available = get_available_agents(memory_context)
+    assert "researcher" not in available
+    assert "sentiment" not in available
+    assert "analyst" in available
+    assert "risk_assessor" in available
+
+
+def test_get_available_agents_no_memory():
+    """With no memory data, all agents should be available."""
+    from investment_research_system.orchestrator.graph import get_available_agents
+
+    available = get_available_agents("No relevant past research found.")
+    assert len(available) == 4
+
+
+def test_default_plan_respects_available_agents():
+    """default_plan should exclude filtered-out agents."""
+    from investment_research_system.orchestrator.graph import default_plan
+
+    plan = default_plan(["analyst", "risk_assessor"])
+    # No gatherers step, only analyzers + report
+    assert len(plan) == 2
+    agent_step = plan[0]
+    assert agent_step["action"] == "dispatch_agents"
+    assert "researcher" not in agent_step["agent_names"]
+    assert "sentiment" not in agent_step["agent_names"]
+
+
+# ============================================================================
+# Task 5: Plan validation
+# ============================================================================
+
+
+def test_validate_plan_valid():
+    """Valid plan should pass through unchanged."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    plan = [
+        {"action": "dispatch_agents", "agent_names": ["researcher", "sentiment"]},
+        {"action": "dispatch_agents", "agent_names": ["analyst"]},
+        {"action": "build_report"},
+    ]
+    result = validate_plan(plan)
+    assert len(result) == 3
+    assert result[-1]["action"] == "build_report"
+
+
+def test_validate_plan_adds_missing_build_report():
+    """Plan without build_report should get one appended."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    plan = [
+        {"action": "dispatch_agents", "agent_names": ["researcher"]},
+    ]
+    result = validate_plan(plan)
+    assert result[-1]["action"] == "build_report"
+    assert len(result) == 2
+
+
+def test_validate_plan_removes_invalid_actions():
+    """Invalid actions should be stripped out."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    plan = [
+        {"action": "hack_the_mainframe"},
+        {"action": "dispatch_agents", "agent_names": ["researcher"]},
+        {"action": "build_report"},
+    ]
+    result = validate_plan(plan)
+    assert len(result) == 2
+    assert result[0]["action"] == "dispatch_agents"
+
+
+def test_validate_plan_removes_invalid_agent_names():
+    """Invalid agent names should be stripped from dispatch_agents steps."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    plan = [
+        {"action": "dispatch_agents", "agent_names": ["researcher", "fake_agent"]},
+        {"action": "build_report"},
+    ]
+    result = validate_plan(plan)
+    assert result[0]["agent_names"] == ["researcher"]
+
+
+def test_validate_plan_skips_dispatch_with_no_valid_agents():
+    """dispatch_agents with only invalid names should be removed entirely."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    plan = [
+        {"action": "dispatch_agents", "agent_names": ["fake1", "fake2"]},
+        {"action": "build_report"},
+    ]
+    result = validate_plan(plan)
+    assert len(result) == 1
+    assert result[0]["action"] == "build_report"
+
+
+def test_validate_plan_empty_input():
+    """Empty plan should produce just build_report."""
+    from investment_research_system.orchestrator.graph import validate_plan
+
+    result = validate_plan([])
+    assert len(result) == 1
+    assert result[0]["action"] == "build_report"
+
+
+def test_validate_plan_max_steps():
+    """Plan exceeding MAX_PLAN_STEPS should be truncated."""
+    from investment_research_system.orchestrator.graph import validate_plan, MAX_PLAN_STEPS
+
+    plan = [{"action": "dispatch_agents", "agent_names": ["researcher"]}] * (MAX_PLAN_STEPS + 3)
+    result = validate_plan(plan)
+    # Truncated to MAX_PLAN_STEPS + build_report appended
+    assert len(result) <= MAX_PLAN_STEPS + 1
+
+
+# ============================================================================
+# Task 5: Plan parsing from LLM output
+# ============================================================================
+
+
+def test_parse_plan_clean_json():
+    """Clean JSON array should parse directly."""
+    from investment_research_system.orchestrator.graph import parse_plan_from_llm
+
+    text = '[{"action": "dispatch_agents", "agent_names": ["researcher"]}, {"action": "build_report"}]'
+    result = parse_plan_from_llm(text)
+    assert len(result) == 2
+
+
+def test_parse_plan_markdown_code_block():
+    """JSON wrapped in markdown code block should parse."""
+    from investment_research_system.orchestrator.graph import parse_plan_from_llm
+
+    text = '```json\n[{"action": "build_report"}]\n```'
+    result = parse_plan_from_llm(text)
+    assert len(result) == 1
+
+
+def test_parse_plan_with_extra_text():
+    """JSON array with surrounding text should still parse."""
+    from investment_research_system.orchestrator.graph import parse_plan_from_llm
+
+    text = 'Here is my plan:\n[{"action": "build_report"}]\nThis should work.'
+    result = parse_plan_from_llm(text)
+    assert len(result) == 1
+
+
+def test_parse_plan_garbage_returns_empty():
+    """Unparseable text should return empty list."""
+    from investment_research_system.orchestrator.graph import parse_plan_from_llm
+
+    result = parse_plan_from_llm("this is not json at all")
+    assert result == []
+
+
+# ============================================================================
+# Task 6: Full orchestrator loop
 # ============================================================================
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_run_produces_report():
-    """Full orchestrator.run() should produce a ResearchReport."""
+    """Full orchestrator.run() should produce a ResearchReport via plan-then-execute."""
     from investment_research_system.orchestrator.graph import ResearchOrchestrator
     from langchain_core.messages import AIMessage
 
@@ -271,24 +513,13 @@ async def test_orchestrator_run_produces_report():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            # Orchestrator decides to dispatch agents
-            return AIMessage(content="", tool_calls=[
-                {"name": "dispatch_agents", "args": {"agent_names": ["researcher"]}, "id": "call_1"}
-            ])
-        elif call_count == 2:
-            # Orchestrator decides to build report
-            return AIMessage(content="", tool_calls=[
-                {"name": "build_report", "args": {"reasoning": "1 agent responded"}, "id": "call_2"}
-            ])
-        elif call_count == 3:
-            # Synthesis LLM call inside build_report tool
-            return AIMessage(content="Synthesized NVIDIA research report", usage_metadata={"input_tokens": 100, "output_tokens": 50})
+            # create_plan: LLM returns a JSON plan
+            return AIMessage(content='[{"action": "dispatch_agents", "agent_names": ["researcher"]}, {"action": "build_report"}]')
         else:
-            # Orchestrator loop comes back after build_report — no more tool calls
-            return AIMessage(content="Research complete.")
+            # build_report synthesis call
+            return AIMessage(content="Synthesized NVIDIA research report", usage_metadata={"input_tokens": 100, "output_tokens": 50})
 
     class MockLLM:
-        """Mock LLM that returns proper AIMessage objects for all calls."""
         async def ainvoke(self, messages, **kwargs):
             return await mock_ainvoke(messages, **kwargs)
         def bind_tools(self, tools):
@@ -314,65 +545,87 @@ async def test_orchestrator_run_produces_report():
     assert report is not None
     assert report.query == query
     assert report.summary != ""
+    assert len(report.agent_responses) >= 1
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_max_iterations_forces_report():
-    """When max iterations exhausted, orchestrator should force a report."""
-    from investment_research_system.orchestrator.graph import ResearchOrchestrator
-
-    async def infinite_search(messages, **kwargs):
-        from langchain_core.messages import AIMessage
-        return AIMessage(content="", tool_calls=[
-            {"name": "search_memory", "args": {"query": "test"}, "id": "call_inf"}
-        ])
-
-    orchestrator_llm = MagicMock()
-    orchestrator_llm.ainvoke = infinite_search
-    orchestrator_llm.bind_tools = MagicMock(return_value=orchestrator_llm)
-
-    memory = AsyncMock()
-    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
-    memory.graph = None
-
-    orchestrator = ResearchOrchestrator(
-        agents=[],
-        memory_manager=memory,
-        orchestrator_llm=orchestrator_llm,
-        max_iterations=2,
-    )
-
-    query = ResearchQuery(query="test")
-    report = await orchestrator.run(query)
-
-    assert report is not None
-    assert "Unable to gather" in report.summary
-
-
-# ============================================================================
-# Task 6: Edge case tests
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_no_llm_configured():
-    """Orchestrator with no LLM should still produce a forced report."""
+async def test_orchestrator_no_llm_uses_default_plan():
+    """Orchestrator with no LLM should use default plan and still produce a report."""
     from investment_research_system.orchestrator.graph import ResearchOrchestrator
 
     memory = AsyncMock()
     memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
     memory.graph = None
 
+    agents = [_make_mock_agent("researcher"), _make_mock_agent("sentiment")]
+
     orchestrator = ResearchOrchestrator(
-        agents=[],
+        agents=agents,
         memory_manager=memory,
         orchestrator_llm=None,
     )
 
-    query = ResearchQuery(query="test")
+    query = ResearchQuery(query="test query")
     report = await orchestrator.run(query)
 
     assert report is not None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_replan_on_agent_failure():
+    """When an agent fails, orchestrator should replan and still produce a report."""
+    from investment_research_system.orchestrator.graph import ResearchOrchestrator
+    from langchain_core.messages import AIMessage
+
+    call_count = 0
+
+    async def mock_ainvoke(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # create_plan: dispatch researcher (will fail) + sentiment
+            return AIMessage(content='[{"action": "dispatch_agents", "agent_names": ["researcher"]}, {"action": "dispatch_agents", "agent_names": ["sentiment"]}, {"action": "build_report"}]')
+        elif call_count == 2:
+            # replan: skip researcher, just build report
+            return AIMessage(content='[{"action": "build_report"}]')
+        else:
+            # synthesis
+            return AIMessage(content="Report based on partial data", usage_metadata={"input_tokens": 50, "output_tokens": 30})
+
+    class MockLLM:
+        async def ainvoke(self, messages, **kwargs):
+            return await mock_ainvoke(messages, **kwargs)
+        def bind_tools(self, tools):
+            return self
+
+    # Researcher fails, sentiment succeeds
+    failing_researcher = AsyncMock()
+    failing_researcher.name = "researcher"
+    failing_researcher.run = AsyncMock(side_effect=Exception("timeout"))
+
+    agents = [failing_researcher, _make_mock_agent("sentiment", "Market is bullish")]
+
+    memory = AsyncMock()
+    memory.parallel_search = AsyncMock(return_value={"long_term": [], "semantic": [], "topics": []})
+    memory.graph = None
+
+    orchestrator = ResearchOrchestrator(
+        agents=agents,
+        memory_manager=memory,
+        orchestrator_llm=MockLLM(),
+    )
+
+    query = ResearchQuery(query="NVIDIA analysis")
+    report = await orchestrator.run(query)
+
+    assert report is not None
+    # Should have called replan
+    assert call_count >= 2
+
+
+# ============================================================================
+# Task 7: Circuit breaker (unchanged)
+# ============================================================================
 
 
 def test_circuit_breaker_trips_after_failures():
